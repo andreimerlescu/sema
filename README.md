@@ -1,4 +1,4 @@
-# Go Semaphore
+# Semaphore (for GoLang)
 
 This package provides a fast implementation of a powerful
 computing technique called the semaphore. These allow you to
@@ -8,12 +8,12 @@ etc related load on your application.
 ## Installation
 
 ```shell
-go get -u github.com/andreimerlescu/go-sema
+go get -u github.com/andreimerlescu/sema
 ```
 
 ## Usage
 
-Integrating `go-sema` into your project is easy.
+Integrating `sema` into your project is easy.
 
 ```go
 package main
@@ -24,7 +24,7 @@ import (
 	`sync/atomic`
 	`time`
 
-	sema "github.com/andreimerlescu/go-sema"
+	"github.com/andreimerlescu/sema"
 )
 
 func main() {

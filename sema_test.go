@@ -1,13 +1,11 @@
-package go_sema
+package sema
 
 import (
-	`fmt`
-	`sync`
-	`sync/atomic`
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
-	`time`
-
-	"github.com/stretchr/testify/assert"
+	"time"
 )
 
 func TestBakersDozen(t *testing.T) {
@@ -17,19 +15,27 @@ func TestBakersDozen(t *testing.T) {
 	tests := []struct {
 		name string
 		args args
-		want Semaphore
 	}{
-		{"test one", args{3}, &semaphore{semC: make(chan struct{}, 3)}},
-		{"test two", args{6}, &semaphore{semC: make(chan struct{}, 6)}},
-		{"test tri", args{9}, &semaphore{semC: make(chan struct{}, 9)}},
+		{"test one", args{3}},
+		{"test two", args{6}},
+		{"test tri", args{9}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := New(tt.args.maxConcurrency); got != nil {
-				for i := 0; i < tt.args.maxConcurrency; i++ {
-					got.Acquire()
-					assert.LessOrEqual(t, i, tt.args.maxConcurrency)
-					assert.Equal(t, got.Len(), i+1)
+			got := New(tt.args.maxConcurrency)
+			if got == nil {
+				t.Error("New() returned nil, expected a non-nil Semaphore")
+				return
+			}
+			for i := 0; i < tt.args.maxConcurrency; i++ {
+				got.Acquire()
+				// Check that i is within bounds (replacing assert.LessOrEqual)
+				if i > tt.args.maxConcurrency {
+					t.Errorf("i = %d, exceeds maxConcurrency %d", i, tt.args.maxConcurrency)
+				}
+				// Check the length of the semaphore (replacing assert.Equal)
+				if gotLen := got.Len(); gotLen != i+1 {
+					t.Errorf("got.Len() = %d, want %d", gotLen, i+1)
 				}
 			}
 		})
@@ -47,6 +53,10 @@ func TestSemaphoreAcquireRelease(t *testing.T) {
 		sem.Release()
 		sem.Release()
 		sem.Release()
+	}
+	// Optionally, we can add a check to ensure the semaphore is empty at the end.
+	if !sem.IsEmpty() {
+		t.Error("semaphore should be empty after all releases")
 	}
 }
 
