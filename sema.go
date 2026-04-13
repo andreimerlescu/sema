@@ -1,82 +1,437 @@
-// Package sema provides a simple semaphore implementation to control concurrency in Go programs.
-// A semaphore is a synchronization primitive that limits the number of goroutines that can run concurrently,
-// ensuring that resources (e.g., CPU, memory, I/O) are not overwhelmed by too many simultaneous tasks.
-// This package is useful for scenarios like parallel file processing, API rate limiting, or managing worker pools.
 package sema
 
-// Semaphore defines the interface for a semaphore that controls concurrent access.
-// It provides methods to acquire and release slots, check the current usage, and determine if the semaphore is empty.
-type Semaphore interface {
-	// Acquire takes a slot in the semaphore, blocking if no slots are available until one is freed.
-	// This method should be called before starting a concurrent task.
-	Acquire()
+import (
+	"context"
+	"fmt"
+	"math"
+	"time"
+)
 
-	// Release frees a slot in the semaphore, allowing another goroutine to acquire it.
-	// This method should be called when a concurrent task is complete.
-	Release()
+// --- single slot ---
 
-	// Len returns the current number of occupied slots in the semaphore.
-	// It indicates how many goroutines are currently active.
-	Len() int
-
-	// IsEmpty returns true if no slots are occupied (i.e., no goroutines are active).
-	IsEmpty() bool
-}
-
-// semaphore is the concrete implementation of the Semaphore interface.
-// It uses a buffered channel to manage a fixed number of slots, where each slot represents a concurrent task.
-type semaphore struct {
-	semC chan struct{} // Buffered channel acting as the semaphore; each slot holds an empty struct{}.
-}
-
-// safe ensures that the maxConcurrency value is within a valid range.
-// It prevents invalid or unsafe values for the semaphore's capacity.
-func safe(maxConcurrency int) int {
-	// If maxConcurrency is -1, set a high default limit (333,333) to allow significant concurrency.
-	if maxConcurrency == -1 {
-		maxConcurrency = 333_333
-	}
-
-	// Ensure maxConcurrency is at least 1 to avoid a zero-capacity channel, which would block forever.
-	if maxConcurrency < 1 {
-		maxConcurrency = 1
-	}
-
-	return maxConcurrency
-}
-
-// New creates a new Semaphore with the specified maximum concurrency.
-// The maxConcurrency parameter determines how many goroutines can run concurrently before blocking.
-// If maxConcurrency is invalid (e.g., -1 or 0), it is adjusted by the safe function.
-func New(maxConcurrency int) Semaphore {
-	// Create a semaphore with a buffered channel of the adjusted maxConcurrency size.
-	return &semaphore{
-		semC: make(chan struct{}, safe(maxConcurrency)),
+func (s *semaphore) Acquire() {
+	s.mu.Lock()
+	for {
+		ch := s.channelLocked()
+		select {
+		case ch <- struct{}{}:
+			s.notify(func(o Observer) { o.OnAcquire(len(ch), cap(ch)) })
+			s.mu.Unlock()
+			return
+		default:
+		}
+		// Channel is full — wait for a Release or SetCap to broadcast.
+		s.cond.Wait()
 	}
 }
 
-// IsEmpty checks if the semaphore has any occupied slots.
-// It returns true if no goroutines are currently active (i.e., the channel is empty).
+func (s *semaphore) AcquireWith(ctx context.Context) error {
+	s.mu.Lock()
+	for {
+		// Check context before attempting.
+		select {
+		case <-ctx.Done():
+			s.mu.Unlock()
+			return ErrAcquireCancelled{Cause: ctx.Err()}
+		default:
+		}
+
+		ch := s.channelLocked()
+		select {
+		case ch <- struct{}{}:
+			s.notify(func(o Observer) { o.OnAcquire(len(ch), cap(ch)) })
+			s.mu.Unlock()
+			return nil
+		default:
+		}
+
+		// Channel is full. Wait for a signal, but also watch the context.
+		// We release the mutex and wait on cond in a goroutine so we can
+		// select on the context concurrently.
+		waitDone := make(chan struct{}, 1)
+		go func() {
+			s.mu.Lock()
+			s.cond.Wait()
+			s.mu.Unlock()
+			select {
+			case waitDone <- struct{}{}:
+			default:
+			}
+		}()
+
+		// Release the lock so the waiter goroutine and other operations can proceed.
+		s.mu.Unlock()
+
+		select {
+		case <-waitDone:
+			// Woken by Broadcast (Release, SetCap, Reset, Drain).
+			// Re-acquire the lock and retry.
+			s.mu.Lock()
+			continue
+		case <-ctx.Done():
+			// Context cancelled. Wake the waiter goroutine so it doesn't leak.
+			s.cond.Broadcast()
+			return ErrAcquireCancelled{Cause: ctx.Err()}
+		}
+	}
+}
+
+func (s *semaphore) AcquireTimeout(d time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	return s.AcquireWith(ctx)
+}
+
+func (s *semaphore) TryAcquire() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch := s.channelLocked()
+	select {
+	case ch <- struct{}{}:
+		s.notify(func(o Observer) { o.OnAcquire(len(ch), cap(ch)) })
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *semaphore) TryAcquireWith(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ErrAcquireCancelled{Cause: ctx.Err()}
+	default:
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch := s.channelLocked()
+	select {
+	case ch <- struct{}{}:
+		s.notify(func(o Observer) { o.OnAcquire(len(ch), cap(ch)) })
+		return nil
+	default:
+		return ErrNoSlot{Requested: 1, Available: cap(ch) - len(ch)}
+	}
+}
+
+func (s *semaphore) Release() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch := s.channelLocked()
+	select {
+	case <-ch:
+		s.notify(func(o Observer) { o.OnRelease(len(ch), cap(ch)) })
+		s.updateEWMA(ch)
+		s.cond.Broadcast()
+		return nil
+	default:
+		return ErrReleaseExceedsCount{Attempted: 1, Current: len(ch)}
+	}
+}
+
+// --- multi slot ---
+
+func (s *semaphore) AcquireN(n int) error {
+	if err := validateN(n); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	ch := s.channelLocked()
+	if n > cap(ch) {
+		s.mu.Unlock()
+		return ErrNExceedsCap{Requested: n, Cap: cap(ch)}
+	}
+	s.mu.Unlock()
+
+	// Use an internal context with a long timeout to avoid permanent
+	// blocking on partial acquires. 10 minutes is generous — callers
+	// who need tighter control should use AcquireNWith directly.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	return s.AcquireNWith(ctx, n)
+}
+
+func (s *semaphore) AcquireNWith(ctx context.Context, n int) error {
+	if err := validateN(n); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	ch := s.channelLocked()
+	if n > cap(ch) {
+		s.mu.Unlock()
+		return ErrNExceedsCap{Requested: n, Cap: cap(ch)}
+	}
+	s.mu.Unlock()
+
+	acquired := 0
+
+	// rollback drains acquired slots from the current channel under lock.
+	rollback := func() {
+		if acquired == 0 {
+			return
+		}
+		s.mu.Lock()
+		rollbackCh := s.channelLocked()
+		for j := 0; j < acquired; j++ {
+			select {
+			case <-rollbackCh:
+			default:
+			}
+		}
+		s.mu.Unlock()
+	}
+
+	for acquired < n {
+		s.mu.Lock()
+		// Check context under lock before waiting.
+		select {
+		case <-ctx.Done():
+			s.mu.Unlock()
+			rollback()
+			return ErrAcquireCancelled{Cause: ctx.Err()}
+		default:
+		}
+
+		ch = s.channelLocked()
+		select {
+		case ch <- struct{}{}:
+			acquired++
+			s.mu.Unlock()
+			continue
+		default:
+		}
+
+		// Channel is full. Wait for a signal, watching the context.
+		waitDone := make(chan struct{}, 1)
+		go func() {
+			s.mu.Lock()
+			s.cond.Wait()
+			s.mu.Unlock()
+			select {
+			case waitDone <- struct{}{}:
+			default:
+			}
+		}()
+
+		s.mu.Unlock()
+
+		select {
+		case <-waitDone:
+			// Woken — retry the send.
+			continue
+		case <-ctx.Done():
+			s.cond.Broadcast()
+			rollback()
+			return ErrAcquireCancelled{Cause: ctx.Err()}
+		}
+	}
+
+	s.mu.Lock()
+	ch = s.channelLocked()
+	s.notify(func(o Observer) { o.OnAcquire(len(ch), cap(ch)) })
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *semaphore) AcquireNTimeout(n int, d time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	return s.AcquireNWith(ctx, n)
+}
+
+func (s *semaphore) TryAcquireN(n int) bool {
+	if err := validateN(n); err != nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch := s.channelLocked()
+	if n > cap(ch) {
+		return false
+	}
+	if s.tryAcquireNLocked(n) {
+		s.notify(func(o Observer) { o.OnAcquire(len(ch), cap(ch)) })
+		return true
+	}
+	return false
+}
+
+func (s *semaphore) TryAcquireNWith(ctx context.Context, n int) error {
+	if err := validateN(n); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ErrAcquireCancelled{Cause: ctx.Err()}
+	default:
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch := s.channelLocked()
+	if n > cap(ch) {
+		return ErrNExceedsCap{Requested: n, Cap: cap(ch)}
+	}
+	if s.tryAcquireNLocked(n) {
+		s.notify(func(o Observer) { o.OnAcquire(len(ch), cap(ch)) })
+		return nil
+	}
+	return ErrNoSlot{Requested: n, Available: cap(ch) - len(ch)}
+}
+
+func (s *semaphore) ReleaseN(n int) error {
+	if err := validateN(n); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch := s.channelLocked()
+	current := len(ch)
+	if n > current {
+		return ErrReleaseExceedsCount{Attempted: n, Current: current}
+	}
+	for i := 0; i < n; i++ {
+		select {
+		case <-ch:
+		default:
+			return ErrReleaseExceedsCount{Attempted: n - i, Current: len(ch)}
+		}
+	}
+	s.notify(func(o Observer) { o.OnRelease(len(ch), cap(ch)) })
+	s.updateEWMA(ch)
+	s.cond.Broadcast()
+	return nil
+}
+
+// --- introspection ---
+
+func (s *semaphore) Wait(ctx context.Context) error {
+	s.notify(func(o Observer) { o.OnWaitStart() })
+
+	s.mu.Lock()
+	// If already empty, return immediately without spawning a goroutine.
+	if s.IsEmpty() {
+		s.mu.Unlock()
+		s.notify(func(o Observer) { o.OnWaitEnd(nil) })
+		return nil
+	}
+
+	// Use a done channel to coordinate between the waiter goroutine
+	// and context cancellation. The stop flag tells the goroutine to
+	// exit when the context is cancelled, preventing a goroutine leak.
+	done := make(chan struct{})
+	stop := make(chan struct{})
+
+	go func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for !s.IsEmpty() {
+			// Check if we've been told to stop before re-waiting.
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			s.cond.Wait()
+		}
+		close(done)
+	}()
+
+	// We held the lock to check IsEmpty above; release it so the
+	// goroutine can acquire it.
+	s.mu.Unlock()
+
+	select {
+	case <-done:
+		s.notify(func(o Observer) { o.OnWaitEnd(nil) })
+		return nil
+	case <-ctx.Done():
+		// Signal the goroutine to stop, then broadcast to wake it.
+		close(stop)
+		s.cond.Broadcast()
+		err := ErrAcquireCancelled{Cause: ctx.Err()}
+		s.notify(func(o Observer) { o.OnWaitEnd(err) })
+		return err
+	}
+}
+
+func (s *semaphore) Drain() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.drainLocked()
+	ch := s.channelLocked()
+	if len(ch) != 0 {
+		return ErrDrain{Cause: fmt.Sprintf("channel not empty after drain, len=%d", len(ch))}
+	}
+	s.resetEWMA()
+	s.cond.Broadcast()
+	return nil
+}
+
+func (s *semaphore) Reset() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := cap(s.channelLocked())
+	ch := newChannel(c)
+	s.ch.Store(&ch)
+	s.resetEWMA()
+	s.cond.Broadcast()
+	return nil
+}
+
+func (s *semaphore) Len() int {
+	return len(s.channel())
+}
+
+func (s *semaphore) Cap() int {
+	return cap(s.channel())
+}
+
+func (s *semaphore) Utilization() float64 {
+	ch := s.channel()
+	c := cap(ch)
+	if c == 0 {
+		return 0
+	}
+	return float64(len(ch)) / float64(c)
+}
+
+func (s *semaphore) UtilizationSmoothed() float64 {
+	return math.Float64frombits(s.ewma.Load())
+}
+
 func (s *semaphore) IsEmpty() bool {
 	return s.Len() == 0
 }
 
-// Len returns the number of currently occupied slots in the semaphore.
-// This represents how many goroutines are actively holding a slot.
-func (s *semaphore) Len() int {
-	return len(s.semC)
+func (s *semaphore) IsFull() bool {
+	return s.Len() == s.Cap()
 }
 
-// Acquire takes a slot in the semaphore, blocking if no slots are available.
-// It sends an empty struct{} to the channel, occupying a slot until Release is called.
-// This method should be called before starting a concurrent task.
-func (s *semaphore) Acquire() {
-	s.semC <- struct{}{}
-}
+func (s *semaphore) SetCap(c int) error {
+	if c == -1 {
+		c = defaultCap
+	}
+	if c < 1 {
+		return ErrInvalidCap{Value: c}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-// Release frees a slot in the semaphore, allowing another goroutine to acquire it.
-// It receives from the channel, removing an occupied slot.
-// This method should be called when a concurrent task is complete.
-func (s *semaphore) Release() {
-	<-s.semC
+	oldCh := s.channelLocked()
+	current := len(oldCh)
+	newCh := newChannel(c)
+
+	if c >= current {
+		for i := 0; i < current; i++ {
+			newCh <- struct{}{}
+		}
+	} else {
+		s.drainLocked()
+	}
+
+	s.ch.Store(&newCh)
+	s.updateEWMA(newCh)
+	s.cond.Broadcast()
+	return nil
 }
