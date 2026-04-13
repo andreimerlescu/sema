@@ -1,6 +1,6 @@
 package sema
 
 const (
-	defaultCap = 17
+	defaultCap = 10
 	ewmaAlpha  = 0.1
 )

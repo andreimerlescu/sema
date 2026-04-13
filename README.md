@@ -166,7 +166,7 @@ type Semaphore interface {
 
 ```go
 // New returns a Semaphore with capacity c.
-// Pass -1 to use the default capacity (17).
+// Pass -1 to use the default capacity (10).
 // Returns ErrInvalidCap for c == 0 or c < -1.
 s, err := sema.New(10)
 
