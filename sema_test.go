@@ -1161,27 +1161,40 @@ func TestErrRecovered_Unwrap(t *testing.T) {
 	}
 }
 
+func TestNew_LargeCapacity(t *testing.T) {
+	s, err := New(1_000_000)
+	if err != nil {
+		t.Fatalf("New(1000000): %v", err)
+	}
+	if s.Cap() != 1_000_000 {
+		t.Errorf("Cap() = %d, want 1000000", s.Cap())
+	}
+}
+
 func TestErrorStrings(t *testing.T) {
 	tests := []struct {
+		name     string
 		err      error
 		contains string
 	}{
-		{ErrInvalidCap{Value: -5}, "-5"},
-		{ErrInvalidN{Value: -3}, "-3"},
-		{ErrReleaseExceedsCount{Attempted: 2, Current: 1}, "2"},
-		{ErrNoSlot{Requested: 3, Available: 1}, "3"},
-		{ErrAcquireCancelled{Cause: context.Canceled}, "cancel"},
-		{ErrDrain{Cause: "oops"}, "oops"},
-		{ErrNExceedsCap{Requested: 10, Cap: 5}, "10"},
+		{"ErrInvalidCap", ErrInvalidCap{Value: -5}, "-5"},
+		{"ErrInvalidN", ErrInvalidN{Value: -3}, "-3"},
+		{"ErrReleaseExceedsCount", ErrReleaseExceedsCount{Attempted: 2, Current: 1}, "2"},
+		{"ErrNoSlot", ErrNoSlot{Requested: 3, Available: 1}, "3"},
+		{"ErrAcquireCancelled", ErrAcquireCancelled{Cause: context.Canceled}, "cancel"},
+		{"ErrDrain", ErrDrain{Cause: "oops"}, "oops"},
+		{"ErrNExceedsCap", ErrNExceedsCap{Requested: 10, Cap: 5}, "10"},
 	}
 	for _, tt := range tests {
-		msg := tt.err.Error()
-		if msg == "" {
-			t.Errorf("%T.Error() returned empty string", tt.err)
-		}
-		if !strings.Contains(msg, tt.contains) {
-			t.Errorf("%T.Error() = %q, want it to contain %q", tt.err, msg, tt.contains)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			msg := tt.err.Error()
+			if msg == "" {
+				t.Errorf("Error() returned empty string")
+			}
+			if !strings.Contains(msg, tt.contains) {
+				t.Errorf("Error() = %q, want it to contain %q", msg, tt.contains)
+			}
+		})
 	}
 }
 
@@ -2153,4 +2166,53 @@ func TestApp_Lifecycle_WaitCancelledDuringDrain(t *testing.T) {
 	}
 
 	_ = s.Drain()
+}
+
+func TestAcquireWith_CancelDoesNotLeakGoroutine(t *testing.T) {
+	s := mustNew(t, 1)
+	s.Acquire() // fill
+
+	before := runtime.NumGoroutine()
+
+	// Repeatedly cancel AcquireWith to stress the goroutine lifecycle.
+	for i := 0; i < 50; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+		_ = s.AcquireWith(ctx)
+		cancel()
+	}
+
+	time.Sleep(100 * time.Millisecond) // let goroutines settle
+
+	after := runtime.NumGoroutine()
+	// Allow tolerance of 2 for runtime background goroutines.
+	if after > before+2 {
+		t.Errorf("goroutine leak: before=%d, after=%d (ran 50 cancellations)",
+			before, after)
+	}
+
+	s.Release()
+}
+
+func TestAcquireNWith_CancelDoesNotLeakGoroutine(t *testing.T) {
+	s := mustNew(t, 2)
+	s.Acquire()
+	s.Acquire() // fill
+
+	before := runtime.NumGoroutine()
+
+	for i := 0; i < 50; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+		_ = s.AcquireNWith(ctx, 1)
+		cancel()
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	after := runtime.NumGoroutine()
+	if after > before+2 {
+		t.Errorf("goroutine leak: before=%d, after=%d (ran 50 cancellations)",
+			before, after)
+	}
+
+	s.ReleaseN(2)
 }

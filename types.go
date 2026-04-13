@@ -23,6 +23,10 @@ type Semaphore interface {
 	ReleaseN(n int) error
 
 	Wait(ctx context.Context) error
+
+	// Drain forcibly removes all held slots. Goroutines that previously
+	// acquired slots will receive ErrReleaseExceedsCount when they call
+	// Release. Coordinate with Wait or application-level flags to avoid this.
 	Drain() error
 	Reset() error
 	Len() int

@@ -28,7 +28,6 @@ func (s *semaphore) Acquire() {
 func (s *semaphore) AcquireWith(ctx context.Context) error {
 	s.mu.Lock()
 	for {
-		// Check context before attempting.
 		select {
 		case <-ctx.Done():
 			s.mu.Unlock()
@@ -45,32 +44,36 @@ func (s *semaphore) AcquireWith(ctx context.Context) error {
 		default:
 		}
 
-		// Channel is full. Wait for a signal, but also watch the context.
-		// We release the mutex and wait on cond in a goroutine so we can
-		// select on the context concurrently.
+		// Channel is full. We need to wait for a signal while also
+		// watching the context. Spawn a goroutine that does a single
+		// cond.Wait and then exits, so the outer loop can re-check
+		// the (possibly swapped) channel.
 		waitDone := make(chan struct{}, 1)
 		go func() {
 			s.mu.Lock()
 			s.cond.Wait()
 			s.mu.Unlock()
-			select {
-			case waitDone <- struct{}{}:
-			default:
-			}
+			waitDone <- struct{}{}
 		}()
 
-		// Release the lock so the waiter goroutine and other operations can proceed.
 		s.mu.Unlock()
 
 		select {
 		case <-waitDone:
-			// Woken by Broadcast (Release, SetCap, Reset, Drain).
-			// Re-acquire the lock and retry.
+			// Woken by Broadcast (from Release, SetCap, etc).
+			// Re-check context before re-acquiring the lock.
+			select {
+			case <-ctx.Done():
+				return ErrAcquireCancelled{Cause: ctx.Err()}
+			default:
+			}
 			s.mu.Lock()
 			continue
 		case <-ctx.Done():
-			// Context cancelled. Wake the waiter goroutine so it doesn't leak.
+			// Context cancelled while waiting. Wake the goroutine
+			// so it doesn't leak.
 			s.cond.Broadcast()
+			<-waitDone // wait for goroutine to exit
 			return ErrAcquireCancelled{Cause: ctx.Err()}
 		}
 	}
@@ -141,11 +144,14 @@ func (s *semaphore) AcquireN(n int) error {
 		s.mu.Unlock()
 		return ErrNExceedsCap{Requested: n, Cap: cap(ch)}
 	}
+	// Fast path: try non-blocking acquire under lock.
+	if s.tryAcquireNLocked(n) {
+		s.notify(func(o Observer) { o.OnAcquire(len(ch), cap(ch)) })
+		s.mu.Unlock()
+		return nil
+	}
 	s.mu.Unlock()
 
-	// Use an internal context with a long timeout to avoid permanent
-	// blocking on partial acquires. 10 minutes is generous — callers
-	// who need tighter control should use AcquireNWith directly.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	return s.AcquireNWith(ctx, n)
@@ -162,33 +168,27 @@ func (s *semaphore) AcquireNWith(ctx context.Context, n int) error {
 		s.mu.Unlock()
 		return ErrNExceedsCap{Requested: n, Cap: cap(ch)}
 	}
-	s.mu.Unlock()
 
 	acquired := 0
 
-	// rollback drains acquired slots from the current channel under lock.
-	rollback := func() {
-		if acquired == 0 {
-			return
-		}
-		s.mu.Lock()
-		rollbackCh := s.channelLocked()
-		for j := 0; j < acquired; j++ {
-			select {
-			case <-rollbackCh:
-			default:
+	defer func() {
+		// Rollback on any exit where we haven't acquired all n.
+		if acquired > 0 && acquired < n {
+			rollbackCh := s.channelLocked()
+			for j := 0; j < acquired; j++ {
+				select {
+				case <-rollbackCh:
+				default:
+				}
 			}
+			s.cond.Broadcast()
 		}
 		s.mu.Unlock()
-	}
+	}()
 
 	for acquired < n {
-		s.mu.Lock()
-		// Check context under lock before waiting.
 		select {
 		case <-ctx.Done():
-			s.mu.Unlock()
-			rollback()
 			return ErrAcquireCancelled{Cause: ctx.Err()}
 		default:
 		}
@@ -197,40 +197,26 @@ func (s *semaphore) AcquireNWith(ctx context.Context, n int) error {
 		select {
 		case ch <- struct{}{}:
 			acquired++
-			s.mu.Unlock()
 			continue
 		default:
 		}
 
-		// Channel is full. Wait for a signal, watching the context.
-		waitDone := make(chan struct{}, 1)
+		done := make(chan struct{})
 		go func() {
-			s.mu.Lock()
-			s.cond.Wait()
-			s.mu.Unlock()
 			select {
-			case waitDone <- struct{}{}:
-			default:
+			case <-ctx.Done():
+				s.cond.Broadcast()
+			case <-done:
 			}
 		}()
 
-		s.mu.Unlock()
-
-		select {
-		case <-waitDone:
-			// Woken — retry the send.
-			continue
-		case <-ctx.Done():
-			s.cond.Broadcast()
-			rollback()
-			return ErrAcquireCancelled{Cause: ctx.Err()}
-		}
+		s.cond.Wait()
+		close(done)
 	}
 
-	s.mu.Lock()
 	ch = s.channelLocked()
 	s.notify(func(o Observer) { o.OnAcquire(len(ch), cap(ch)) })
-	s.mu.Unlock()
+	acquired = n // prevent rollback in defer
 	return nil
 }
 
@@ -355,6 +341,11 @@ func (s *semaphore) Wait(ctx context.Context) error {
 	}
 }
 
+// Drain forcibly empties all held slots from the channel. This does NOT
+// coordinate with goroutines that hold slots — they will receive
+// ErrReleaseExceedsCount when they subsequently call Release. Use Wait
+// to let in-flight work finish gracefully before calling Drain. The EWMA
+// is reset to zero after draining.
 func (s *semaphore) Drain() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -368,6 +359,10 @@ func (s *semaphore) Drain() error {
 	return nil
 }
 
+// Reset replaces the internal channel with a fresh one, discarding all
+// held slots. Like Drain, goroutines that hold slots from before the
+// reset will receive ErrReleaseExceedsCount. Cap is preserved. EWMA is
+// reset to zero.
 func (s *semaphore) Reset() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

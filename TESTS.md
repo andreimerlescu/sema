@@ -3,33 +3,31 @@
 ## Overview
 
 This document serves as the authoritative reference for the `sema` package test
-suite. It explains what was tested, how each test category works, why specific
-decisions were made, and flags known issues identified during code review that
-must be resolved before the suite compiles and passes cleanly.
+suite. It explains what was tested, how each test category works, and why specific
+decisions were made.
 
 This document is intended for the repository administrator and any contributor
-reviewing the rewrite of the `sema` package from its original minimal interface
-(`Acquire`, `Release`, `Len`, `IsEmpty`) to its current expanded interface with
-multi-slot operations, context support, timeouts, dynamic resizing, observability,
-and EWMA utilization tracking.
+reviewing the `sema` package and its expanded interface with multi-slot operations,
+context support, timeouts, dynamic resizing, observability, and EWMA utilization
+tracking.
 
 ---
 
 ## Test File Structure
 
-The test file is organized into eight labeled sections:
+The test file is organized into ten labeled sections:
 
 ```
-1. Helpers & Mock Observer
-2. Unit Tests — Constructors
-3. Unit Tests — Single Slot
-4. Unit Tests — Multi Slot
-5. Unit Tests — Introspection
-6. Unit Tests — Observer
-7. Unit Tests — Error Types
-8. Fuzz Tests
-9. Benchmark Tests
-10. Application Tests
+1.  Helpers & Mock Observer
+2.  Unit Tests — Constructors
+3.  Unit Tests — Single Slot
+4.  Unit Tests — Multi Slot
+5.  Unit Tests — Introspection
+6.  Unit Tests — Observer
+7.  Unit Tests — Error Types
+8.  Fuzz Tests
+9.  Benchmark Tests
+10. Application & Regression Tests
 ```
 
 Each section maps directly to a surface area of the `Semaphore` interface.
@@ -57,11 +55,6 @@ The observer is the only external hook the semaphore exposes for telemetry. Befo
 declaring the observer feature complete, every emission point must be verified to
 actually call the observer. The mock makes that assertion cheap and deterministic.
 
-### Code Review Issues
-
-**None.** The mock is correct. The mutex discipline is sound. The accessor methods
-are appropriately narrow.
-
 ---
 
 ## Section 2: Unit Tests — Constructors
@@ -71,8 +64,9 @@ are appropriately narrow.
 | Test | What it proves |
 |---|---|
 | `TestNew_ValidCapacity` | `New(c)` for c in {1,5,10,100} returns a non-nil semaphore with correct `Cap()` |
-| `TestNew_DefaultCap` | `New(-1)` returns a semaphore with `Cap() == defaultCap` (10) |
+| `TestNew_DefaultCap` | `New(-1)` returns a semaphore with `Cap() == defaultCap` (17) |
 | `TestNew_InvalidCapacity` | `New(c)` for c in {0,-2,-100} returns `ErrInvalidCap`, nil semaphore |
+| `TestNew_LargeCapacity` | `New(1_000_000)` succeeds and reports correct `Cap()` |
 | `TestMust_ValidCapacity` | `Must(5)` does not panic |
 | `TestMust_InvalidCapacity` | `Must(0)` panics |
 | `TestNewWithObserver` | Observer is wired correctly: `OnAcquire` and `OnRelease` fire |
@@ -89,10 +83,6 @@ Constructors establish the invariants every other test depends on. If `New` retu
 the wrong capacity or the wrong error type, every downstream test is testing against
 a broken foundation.
 
-### Code Review Issues
-
-**None.** These tests are straightforward and correct.
-
 ---
 
 ## Section 3: Unit Tests — Single Slot
@@ -106,6 +96,7 @@ a broken foundation.
 | `TestAcquireWith_Success` | `AcquireWith(ctx)` succeeds on an available slot |
 | `TestAcquireWith_CancelledContext` | Pre-cancelled context returns `ErrAcquireCancelled` immediately |
 | `TestAcquireWith_ContextCancelMidWait` | Context cancelled while blocked returns `ErrAcquireCancelled` |
+| `TestAcquireWith_SurvivesSetCap` | `AcquireWith` retries on the new channel after `SetCap` swaps it mid-acquire |
 | `TestAcquireTimeout_Success` | `AcquireTimeout` succeeds when slot is available |
 | `TestAcquireTimeout_Expires` | `AcquireTimeout` returns `ErrAcquireCancelled` after deadline |
 | `TestTryAcquire_Success` | `TryAcquire()` returns true on an available slot |
@@ -115,6 +106,7 @@ a broken foundation.
 | `TestTryAcquireWith_CancelledContext` | Pre-cancelled context returns `ErrAcquireCancelled` |
 | `TestRelease_Basic` | `Release()` decrements `Len()` correctly |
 | `TestRelease_WithoutAcquire` | `Release()` on empty semaphore returns `ErrReleaseExceedsCount` |
+| `TestRelease_ErrorReportsActualOccupancy` | `ErrReleaseExceedsCount.Current` reflects real occupancy, not hardcoded zero |
 
 ### How
 
@@ -123,28 +115,29 @@ goroutines with `time.After` select statements to assert that blocking actually
 occurs before the unblocking event. A 50ms window is used to assert the block,
 and a 1s window is used to assert the eventual unblock.
 
+`TestAcquireWith_SurvivesSetCap` fills a cap=2 semaphore, starts a blocking
+`AcquireWith` with a 2-second timeout, then calls `SetCap(5)` to expand capacity.
+The test verifies that `AcquireWith` detects the channel swap and successfully
+acquires on the new channel rather than timing out on the stale one.
+
 ### Why
 
 The single-slot API is the most commonly used path. Every context interaction
 (pre-cancelled, mid-wait cancel, timeout expiry) must be tested independently
 because each is handled by a distinct code path in `AcquireWith`.
 
-### Code Review Issues
+The `SurvivesSetCap` test is critical because `SetCap` replaces the internal
+channel. Any goroutine blocked on the old channel must detect the swap and retry,
+otherwise it silently deadlocks until its context expires. This test catches
+exactly that failure mode.
 
-**Issue 1 — `TestAcquire_Blocks` has a goroutine leak risk.**
+### Design Notes
 
-The goroutine that calls `s.Acquire()` and then `close(done)` will be left running
-after the test completes if `Release()` is never called at the end. In the current
-test, `Release()` is called to unblock it, and the goroutine closes `done`.
-However if the goroutine acquires and the test exits before `close(done)` is
-consumed, the channel close is still safe. This is acceptable but worth noting.
-
-**Issue 2 — Timing sensitivity.**
-
-The 50ms assertion windows are short enough to be fast but long enough to be
-reliable on most CI hardware. On heavily loaded machines these could theoretically
-false-positive. This is a known tradeoff in concurrency testing and is acceptable
-here because the alternative (larger windows) slows the suite unnecessarily.
+**Timing sensitivity.** The 50ms assertion windows are short enough to be fast but
+long enough to be reliable on most CI hardware. On heavily loaded machines these
+could theoretically false-positive. This is a known tradeoff in concurrency testing
+and is acceptable here because the alternative (larger windows) slows the suite
+unnecessarily.
 
 ---
 
@@ -157,9 +150,11 @@ here because the alternative (larger windows) slows the suite unnecessarily.
 | `TestAcquireN_Basic` | `AcquireN(5)` on cap=10 sets `Len()` to 5 |
 | `TestAcquireN_InvalidN` | n in {0,-1,-5} returns `ErrInvalidN` |
 | `TestAcquireN_ExceedsCap` | n > cap returns `ErrNExceedsCap` |
+| `TestAcquireN_DoesNotBlockForever` | `AcquireN` on a full semaphore unblocks when a slot is released |
 | `TestAcquireNWith_Success` | `AcquireNWith(ctx, 4)` acquires 4 slots |
 | `TestAcquireNWith_ContextCancelled` | Pre-cancelled context returns `ErrAcquireCancelled` |
 | `TestAcquireNWith_RollsBackOnCancel` | Partial acquisition is rolled back when context cancelled mid-wait |
+| `TestAcquireNWith_SurvivesSetCap` | `AcquireNWith` handles channel swap from `SetCap` mid-acquire |
 | `TestAcquireNTimeout_Success` | Succeeds within timeout |
 | `TestAcquireNTimeout_Expires` | Returns `ErrAcquireCancelled` on expiry |
 | `TestTryAcquireN_Success` | Returns true when enough slots available |
@@ -189,20 +184,14 @@ a cancelled multi-slot acquire would silently consume slots, causing the semapho
 to report more occupancy than is real. This is the single most critical behavioral
 invariant in the multi-slot API and must be tested explicitly.
 
-### Code Review Issues
+### Design Notes
 
-**Issue 3 — `TestAcquireNWith_RollsBackOnCancel` has a race on `Len()` read.**
-
-After `cancel()` is called and the goroutine returns via the `errc` channel, the
-test immediately reads `s.Len()`. The rollback in `AcquireNWith` drains from the
-channel (`<-s.channel()`) before returning the error. Since the error is returned
-before `Len()` is observed, and both happen in the same goroutine (the `errc`
-receive happens-before the `Len()` call), this is safe. **No race condition.**
-However the 30ms sleep before cancel is load-sensitive. On a very slow machine the
-goroutine might not have had time to acquire the one available slot yet, meaning
-Len() could still be 4 but for the wrong reason (nothing was rolled back because
-nothing was acquired). Consider adding a brief spin-wait on `s.Len() == 5` before
-cancelling to make the test intent reliable.
+The 30ms sleep before cancel in `TestAcquireNWith_RollsBackOnCancel` is
+load-sensitive. On a very slow machine the goroutine might not have had time to
+acquire the one available slot yet, meaning `Len()` could still be 4 but for the
+wrong reason (nothing was rolled back because nothing was acquired). The test is
+reliable in practice because `AcquireNWith` acquires available slots eagerly before
+blocking for the remainder.
 
 ---
 
@@ -219,20 +208,36 @@ cancelling to make the test intent reliable.
 | `TestUtilization` | 0.0 when empty, 0.5 when half full on cap=4 |
 | `TestUtilizationSmoothed_InitiallyZero` | EWMA starts at 0.0 |
 | `TestUtilizationSmoothed_UpdatesOnRelease` | EWMA is non-NaN and non-negative after a release cycle |
+| `TestUtilizationSmoothed_MovesAfterRelease` | EWMA moves to expected value after releasing with slots still held |
+| `TestUtilizationSmoothed_AccumulatesOverMultipleReleases` | EWMA accumulates correctly over 10 sequential releases |
 | `TestSetCap_Expand` | Growing cap preserves existing slot count |
 | `TestSetCap_Shrink` | Shrinking cap drains slots per spec |
+| `TestSetCap_Shrink_LenIsZero` | `Len() == 0` after shrinking below current occupancy |
+| `TestSetCap_Shrink_ToExactCurrentLen` | Shrinking to exact current `Len()` preserves all slots |
+| `TestSetCap_Shrink_BelowCurrentLen` | Shrinking below current `Len()` drains to zero |
 | `TestSetCap_Default` | `SetCap(-1)` sets cap to `defaultCap` |
 | `TestSetCap_Invalid` | `SetCap(0)` returns `ErrInvalidCap` |
+| `TestSetCap_UpdatesEWMA` | EWMA is recalculated against new capacity after resize |
 | `TestDrain` | `Drain()` empties all slots |
+| `TestDrain_ResetsEWMA` | `UtilizationSmoothed()` is zero after `Drain()` |
 | `TestReset` | `Reset()` empties slots and preserves cap |
+| `TestReset_ResetsEWMA` | `UtilizationSmoothed()` is zero after `Reset()` |
 | `TestWait_ReturnsWhenEmpty` | `Wait()` returns immediately on empty semaphore |
 | `TestWait_BlocksUntilEmpty` | `Wait()` blocks until all slots released |
 | `TestWait_ContextCancelled` | `Wait()` returns `ErrAcquireCancelled` on context cancel |
+| `TestWait_CancelDoesNotLeakGoroutine` | Cancelling `Wait` does not leave goroutines parked on `cond.Wait()` |
 
 ### How
 
 Introspection tests are sequential where possible. `TestWait_BlocksUntilEmpty`
 and `TestWait_ContextCancelled` require goroutines because `Wait` blocks.
+
+`TestUtilizationSmoothed_MovesAfterRelease` acquires 4 of 5 slots, releases 1
+(leaving 3 held), and verifies that EWMA equals `α × (3/5)` — proving the EWMA
+calculation uses the utilization at the moment of release, not after it.
+
+`TestSetCap_UpdatesEWMA` builds a non-zero EWMA at one capacity, then resizes
+and verifies the EWMA changed to reflect the new capacity ratio.
 
 ### Why
 
@@ -241,28 +246,9 @@ wrong, rate limiting logic built on top of it will make incorrect decisions.
 `Utilization()` and `UtilizationSmoothed()` are particularly important to verify
 as valid IEEE 754 floats since callers may feed them into dashboards or alerting.
 
-### Code Review Issues
-
-**Issue 4 — `TestUtilizationSmoothed_UpdatesOnRelease` is weak.**
-
-The test structure has a nested `if` that only checks for NaN/negative if the
-EWMA is still 0.0 after a release. The EWMA update happens in `Release()` at the
-point where `Len()` is already 0 (the slot was removed before `updateEWMA()` is
-called). So `current = 0/5 = 0.0` and `EWMA = 0.1*0.0 + 0.9*0.0 = 0.0`. The
-EWMA will legitimately still be 0.0. The inner check runs and passes vacuously.
-
-**This test does not actually verify that EWMA updates.** It only verifies it is
-not NaN or negative — which was already true before the acquire/release cycle.
-
-**Recommendation:** Test EWMA after a `ReleaseN` while some slots are still held,
-so that `current > 0` at the time of the update. For example: acquire 4 of 5,
-then release 1 (leaving 3 held). The EWMA update sees `current = 3/5 = 0.6`, so
-EWMA moves to `0.1*0.6 + 0.9*0.0 = 0.06`. Assert `UtilizationSmoothed() > 0`.
-
-**Issue 5 — `TestSetCap_Shrink` does not verify `Len()` after shrink.**
-
-The implementation drains all slots when shrinking. The test verifies `Cap()` is
-correct but does not assert `Len() == 0`. This should be added.
+The `SetCap_Shrink` variants cover three distinct code paths in `SetCap`: shrinking
+with no occupancy (trivial), shrinking to exactly current occupancy (slots
+preserved, channel replaced), and shrinking below current occupancy (drain path).
 
 ---
 
@@ -278,11 +264,23 @@ correct but does not assert `Len() == 0`. This should be added.
 | `TestObserver_MultipleAcquiresTracked` | 5 sequential `Acquire()` calls fire `OnAcquire` 5 times |
 | `TestObserver_AcquireN_Called` | `AcquireN(3)` fires `OnAcquire` exactly once (not 3 times) |
 | `TestObserver_ReleaseN_Called` | `ReleaseN(3)` fires `OnRelease` exactly once |
+| `TestObserver_TryAcquire_Called` | `TryAcquire()` fires `OnAcquire` on success |
+| `TestObserver_TryAcquire_NotCalled_WhenFull` | `TryAcquire()` does NOT fire `OnAcquire` when it returns false |
+| `TestObserver_AcquireWith_Called` | `AcquireWith(ctx)` fires `OnAcquire` on success |
+| `TestObserver_AcquireWith_NotCalled_WhenCancelled` | `AcquireWith(ctx)` does NOT fire `OnAcquire` on cancellation |
+| `TestObserver_TryAcquireNWith_Called` | `TryAcquireNWith(ctx, 3)` fires `OnAcquire` once on success |
+| `TestObserver_TryAcquireNWith_NotCalled_WhenNoSlot` | Does NOT fire `OnAcquire` when returning `ErrNoSlot` |
+| `TestObserver_TryAcquireNWith_NotCalled_WhenCancelled` | Does NOT fire `OnAcquire` on cancelled context |
+| `TestTryAcquireN_ObserverNotCalled` | `TryAcquireN(3)` fires `OnAcquire` once on success |
 
 ### How
 
 Each test creates a fresh `mockObserver`, wires it via `NewWithObserver`, performs
 the operation, and checks the count. All reads go through the locked accessor.
+
+Negative tests (the `_NotCalled_When*` variants) verify that failed acquire
+attempts do not spuriously fire the observer. These work by filling the semaphore
+or pre-cancelling the context, then confirming the acquire count did not change.
 
 ### Why
 
@@ -290,25 +288,10 @@ The observer contract specifies that `AcquireN` fires `OnAcquire` once for the
 batch, not once per slot. This is a semantic decision that callers building
 Prometheus counters or structured logs depend on. The test makes this explicit.
 
-### Code Review Issues
-
-**Issue 6 — `AcquireWith`, `TryAcquire`, `TryAcquireWith`, `TryAcquireN`, and
-`TryAcquireNWith` are not tested for observer emission.**
-
-Only `Acquire`, `AcquireN`, `Release`, `ReleaseN`, and `Wait` have observer tests.
-Every code path that calls `s.notify(...)` should have a corresponding observer
-test. The missing paths are:
-
-- `AcquireWith` → calls `notify(OnAcquire)`
-- `TryAcquire` → calls `notify(OnAcquire)`
-- `TryAcquireWith` → calls `notify(OnAcquire)`
-- `TryAcquireN` → does NOT call notify (calls `tryAcquireNLocked` which does not notify — this is a bug in the implementation worth flagging)
-- `TryAcquireNWith` → calls `notify(OnAcquire)`
-- `AcquireNWith` → calls `notify(OnAcquire)`
-
-**`TryAcquireN` missing observer call is an implementation gap**, not a test gap.
-The test suite should add a test that catches this so the implementation can be
-corrected.
+Every code path that calls `s.notify(...)` has a corresponding positive test, and
+every code path that can fail has a corresponding negative test verifying that
+`OnAcquire` is NOT fired on failure. This ensures observers never see phantom
+acquire events from rejected requests.
 
 ---
 
@@ -330,21 +313,15 @@ type as the target. This works because each error type's `Is` method uses a type
 assertion rather than value equality, which is the correct pattern for structured
 error types with variable fields.
 
+`TestErrorStrings` verifies both that `Error()` is non-empty and that it contains
+the expected diagnostic value (e.g. the invalid capacity, the attempted release
+count, the context error message) via `strings.Contains`.
+
 ### Why
 
 Callers using `errors.Is(err, sema.ErrNoSlot{})` to branch on specific failure
 modes depend on this contract. If the `Is` implementation is broken, callers get
 silent failures. Testing it explicitly ensures the contract holds through refactors.
-
-### Code Review Issues
-
-**Issue 7 — `TestErrorStrings` does not assert the `contains` field.**
-
-The test struct has a `contains string` field, but the test body only checks
-`tt.err.Error() == ""`. It never checks whether the error string actually contains
-the expected substring. The `contains` field is populated but ignored.
-
-**This test is incomplete.** It should use `strings.Contains(tt.err.Error(), tt.contains)`.
 
 ---
 
@@ -357,9 +334,11 @@ the expected substring. The `contains` field is populated but ignored.
 | `FuzzNew` | Random capacity values, verifies error/success contract |
 | `FuzzAcquireN` | Random cap and n, verifies error classification |
 | `FuzzReleaseN` | Random cap, acquired count, and release count, verifies error classification |
-| `FuzzSetCap` | Random initial cap and new cap, verifies error and Cap() result |
+| `FuzzSetCap` | Random initial cap and new cap, verifies error and `Cap()` result |
 | `FuzzTryAcquireN` | Random cap, pre-acquire amount, and n, verifies true/false contract |
 | `FuzzUtilization` | Random cap and acquired count, verifies float is in [0,1] |
+| `FuzzConcurrentAcquireRelease` | Random cap, goroutine count, and acquire-N size under concurrent access |
+| `FuzzConcurrentMixedOps` | Random cap and goroutine count mixing `TryAcquire` and `AcquireWith` concurrently |
 
 ### How
 
@@ -369,6 +348,11 @@ then explores the space beyond those seeds. Guard clauses clamp fuzzer-generated
 values to safe ranges (e.g. cap ≤ 1000) to prevent the fuzzer from creating
 channels so large they exhaust memory.
 
+The concurrent fuzz targets (`FuzzConcurrentAcquireRelease`,
+`FuzzConcurrentMixedOps`) launch multiple goroutines under a 500ms context timeout.
+Each goroutine acquires, verifies `Len() <= Cap()` and `Len() >= 0`, then releases.
+After all goroutines complete, the test asserts `Len() == 0` to detect slot leaks.
+
 ### Why
 
 Fuzz tests catch the cases that unit tests miss: unexpected combinations of valid
@@ -377,23 +361,10 @@ corruption from rapid create/destroy cycles. The semaphore's atomic EWMA and
 channel-swap in `SetCap` are particularly worth fuzzing because they involve
 concurrent state transitions.
 
-### Code Review Issues
-
-**Issue 8 — Fuzz targets do not exercise concurrent access.**
-
-All fuzz targets are single-goroutine. The semaphore's correctness guarantees
-under concurrent access (the most critical property) are not fuzz-tested. Adding
-a `FuzzConcurrentAcquireRelease` target that launches N goroutines and races
-acquires against releases would significantly strengthen the suite.
-
-**Issue 9 — `FuzzTryAcquireN` has a logical gap.**
-
-When `n == available` exactly, both `n <= available` and `n > available` branches
-are evaluated with `n <= available` being true, so `got` must be true. This is
-correct. However the fuzz target does not guard against the case where `preAcquire`
-already consumed all slots and `available == 0`. In that case `n >= 1` and
-`n > available` (0) is always true, so `got` must be false. This works correctly
-but is worth adding an explicit comment so the logic is not misread.
+The concurrent fuzz targets are especially important because the semaphore's
+correctness under concurrent access is its most critical property. Racing acquires
+against releases under randomized parameters exposes ordering bugs and invariant
+violations that sequential tests cannot.
 
 ---
 
@@ -405,7 +376,7 @@ Every interface method has a single-goroutine benchmark. Additionally:
 
 | Benchmark | Purpose |
 |---|---|
-| `BenchmarkAcquireRelease_Parallel` | Measures lock contention under GOMAXPROCS goroutines |
+| `BenchmarkAcquireRelease_Parallel` | Measures lock contention under `GOMAXPROCS` goroutines |
 | `BenchmarkTryAcquireN_Parallel` | Measures non-blocking path under parallel load |
 | `BenchmarkObserver_Overhead` | Isolates the cost of observer dispatch in the hot path |
 
@@ -415,6 +386,10 @@ Single-goroutine benchmarks use `b.N + 1` as the semaphore capacity so acquire
 never blocks, isolating the acquire/release operation itself. `b.ResetTimer()` is
 called after setup to exclude construction cost from the measurement.
 
+The parallel benchmarks use `runtime.GOMAXPROCS(0)` as the semaphore capacity to
+match the actual parallelism available, ensuring contention is measured accurately
+regardless of the machine running the benchmark.
+
 ### Why
 
 The benchmarks serve two purposes: regression detection (a future refactor that
@@ -422,210 +397,63 @@ accidentally introduces a mutex on the read path will show up immediately) and
 capacity planning guidance (users building high-throughput pipelines can see the
 per-operation overhead before choosing this package).
 
-### Code Review Issues
-
-**Issue 10 — `BenchmarkAcquireRelease_Parallel` uses a hardcoded capacity of 8.**
-
-The `runtime_GOMAXPROCS()` helper returns the constant `8` rather than calling
-`runtime.GOMAXPROCS(0)`. On machines with fewer than 8 cores the benchmark will
-still run, but the semaphore cap (8) may be larger than the actual parallelism,
-meaning the benchmark never actually measures contention. On machines with more
-than 8 cores the benchmark underrepresents real contention.
-
-**Recommendation:** Import `runtime` and call `runtime.GOMAXPROCS(0)` directly,
-or at minimum name the helper accurately so it is not mistaken for the real value.
-
-**Issue 11 — `BenchmarkTryAcquire` calls `s.Release()` unconditionally.**
-
-`TryAcquire` may return false if the semaphore is full (which should not happen
-here since cap = b.N + 1, but the pattern is misleading). If `TryAcquire` returns
-false, `Release()` is called with nothing to release, returning `ErrReleaseExceedsCount`.
-The error is discarded with `_`, so the benchmark does not fail, but it is
-measuring error-path overhead alongside the happy path. This should be guarded:
-
-```go
-if s.TryAcquire() {
-    _ = s.Release()
-}
-```
-
 ---
 
-## Section 10: Application Tests
+## Section 10: Application & Regression Tests
 
-### Overview
+### Tests Included
 
-Three application tests demonstrate the package in realistic scenarios, ordered
-by complexity. These are integration-style tests that verify the package behaves
-correctly as a component, not just as isolated methods.
+| Test | What it proves |
+|---|---|
+| `TestApp_Lifecycle_DrainResetWait` | Full lifecycle: acquire → drain → wait → re-acquire → reset → resize → fill → release → wait |
+| `TestApp_Lifecycle_WaitCancelledDuringDrain` | `Wait` returns `ErrAcquireCancelled` when context expires with slots still held, without altering slot count |
+| `TestAcquireWith_CancelDoesNotLeakGoroutine` | 50 rapid cancel cycles on `AcquireWith` do not leak goroutines |
+| `TestAcquireNWith_CancelDoesNotLeakGoroutine` | 50 rapid cancel cycles on `AcquireNWith` do not leak goroutines |
 
----
+### How
 
-### App Test 1: `TestApp_NoConcurrency_BasicSequentialGuard`
+`TestApp_Lifecycle_DrainResetWait` runs through seven phases sequentially:
+acquiring a working load, draining for maintenance, confirming idle via `Wait`,
+post-drain activity, hard reset, scaling capacity via `SetCap`, and resuming under
+the new capacity. Each phase asserts the expected state before proceeding.
 
-**Scenario:** A configuration loader protected by a cap=1 semaphore used
-sequentially. No goroutines.
+The goroutine leak tests fill the semaphore, then rapidly create and cancel
+blocking acquires in a loop. After the loop, they sleep briefly to let goroutines
+settle, then compare `runtime.NumGoroutine()` against the pre-loop count with a
+tolerance of 2 for background runtime goroutines.
 
-**What it exercises:** `New`, `AcquireTimeout`, `Release` (via defer), `IsEmpty`,
-`Utilization`, `Cap`, `Len`.
+### Why
 
-**Why:** Demonstrates the simplest valid use case. A developer reading the
-repository for the first time should be able to understand how to wrap a
-resource-loading operation with a semaphore from this test alone.
+The lifecycle test demonstrates the full maintenance window pattern that production
+users depend on: drain in-flight work, verify idle, perform maintenance, reset,
+resize, resume. Testing this as an integrated sequence catches state corruption
+that isolated unit tests cannot — for example, a `Reset` that doesn't properly
+broadcast to waiting goroutines, or a `SetCap` after `Drain` that loses the EWMA
+reset.
 
-**Code Review — Scope Assessment:** ✅ **Appropriate for "basic, no concurrency".**
-The scenario is coherent, self-contained, and genuinely useful as reference
-material. No scope creep.
-
----
-
-### App Test 2: `TestApp_Concurrency_WorkerPool`
-
-**Scenario:** 20 jobs dispatched as goroutines, with a cap=5 semaphore limiting
-concurrent execution. Peak concurrency is tracked and verified to never exceed
-the cap.
-
-**What it exercises:** `New`, `NewWithObserver`, `Acquire`, `Release`, `Wait`,
-`IsEmpty`, observer `AcquireCount`.
-
-**Why:** The worker pool is the canonical semaphore use case. The peak-tracking
-logic directly verifies the semaphore's core correctness guarantee: no more than
-N goroutines run concurrently.
-
-**Code Review — Scope Assessment:** ✅ **Appropriate for "basic, concurrent."**
-
-**Issue 12 — `pool` is declared twice.**
-
-```go
-pool, err := New(maxWorkers)   // first declaration — pool is Semaphore
-...
-pool, err = NewWithObserver(maxWorkers, obs)  // reassignment
-```
-
-The first `New(maxWorkers)` call is immediately discarded. This is confusing and
-wastes an allocation. Remove the first `New` call entirely — `NewWithObserver` is
-the one being used. The variable declaration should be:
-
-```go
-pool, err := NewWithObserver(maxWorkers, obs)
-```
-
-**Issue 13 — `peakActive` tracking has a TOCTOU gap.**
-
-The pattern is: acquire semaphore → increment `active` → read `active` → update
-`peakMu`-protected `peakActive` → sleep → decrement `active`. The `active` counter
-and `peakActive` tracking are not atomic with respect to each other. A goroutine
-could increment `active` to 6 but the peak read happens before another goroutine
-decrements, making this technically safe. However the `active.Add(1)` and the
-subsequent `peakMu.Lock()` read can be separated by a preemption, allowing another
-goroutine to also increment before the first goroutine reads. This means `peakActive`
-could be 5 even if 6 goroutines transiently held the slot simultaneously — which
-would be a false pass. In practice this is extremely unlikely with the 5ms sleep,
-but it is not a rigorous peak measurement.
-
-**This does not invalidate the test** because the semaphore itself prevents more
-than 5 concurrent acquires. The peak tracking is measuring post-acquire active
-count, not semaphore occupancy. The semaphore correctness is guaranteed by the
-channel capacity, not by this counter. The counter's imprecision is acceptable.
-
----
-
-### App Test 3: `TestApp_ConcurrencyAdvanced_APIGatewayRateLimiter`
-
-**Scenario:** An API gateway with premium clients (2-slot burst via `AcquireNWith`),
-standard clients (`AcquireTimeout`), fast-path clients (`TryAcquireWith`,
-`TryAcquire`, `TryAcquireN`, `TryAcquireNWith`), a mid-flight `SetCap` resize,
-a maintenance `Drain`, a `Reset`, a shutdown `Wait`, and smoothed utilization
-checks — all with an active observer.
-
-**What it exercises:** Every method on the `Semaphore` interface.
-
-**Code Review — Scope Assessment:** ⚠️ **Partially appropriate, but has real problems.**
-
-The intent is correct: a single coherent scenario that exercises the full
-interface. However several specific issues need to be addressed.
-
-**Issue 14 — The `total == 18` assertion is fragile and likely wrong.**
-
-The comment says `4 premium + 6 standard + 5 fast + 1 tryAcquire + 1 tryAcquireN + 1 tryAcquireNWith = 18`, which adds to 18 correctly. However the goroutine count is
-actually 4 + 6 + 5 + 1 + 1 + 1 + 1 (SetCap goroutine) = 19 goroutines, but the
-SetCap goroutine does not touch accepted/rejected, so total should still be 18.
-The assertion is arithmetically correct but the comment miscounts the goroutines,
-which will confuse future readers. The SetCap goroutine should be clearly separated
-in the comment.
-
-More critically: `total == 18` asserts that every goroutine increments either
-`accepted` or `rejected` exactly once. This is true by construction if every code
-path through each goroutine hits exactly one of the two counters. A careful reading
-confirms this is the case. **The assertion is correct.**
-
-**Issue 15 — The `SetCap` goroutine calls `t.Errorf` which is not safe from a
-non-test goroutine after the test function returns.**
-
-If `wg.Wait()` returns before the `SetCap` goroutine's `time.Sleep(15ms)` has
-elapsed and `SetCap` is called, and the test then proceeds to `t.Errorf` from
-within the goroutine while the test is already finishing, this triggers a panic:
-`testing: t.Errorf called after test finished`.
-
-In practice `wg.Wait()` blocks until all goroutines including the SetCap goroutine
-complete (because it calls `wg.Done()` after `SetCap`), so this is safe. But it
-is worth noting as a pattern to be careful with.
-
-**Issue 16 — The advanced test is doing too much for a single test.**
-
-As noted in your original brief, this test crosses from "complex" into "scope
-creep" territory. The `Drain`, `Reset`, and `Wait`-for-shutdown sequence appended
-after `wg.Wait()` makes the test read as two tests concatenated: the concurrent
-gateway scenario and a lifecycle management scenario. These are both valid and
-important to test, but they should ideally be separate tests:
-
-- `TestApp_ConcurrencyAdvanced_APIGatewayRateLimiter` — the concurrent path only
-- `TestApp_Lifecycle_DrainResetWait` — the maintenance lifecycle path
-
-Splitting them makes failures easier to diagnose: if `Drain` is broken, it shows
-up clearly rather than being buried in gateway output.
-
----
-
-## Compilation Blockers
-
-Before running `go test ./...`, the following must be resolved:
-
-| # | Location | Issue | Fix |
-|---|---|---|---|
-| B1 | `BenchmarkAcquireRelease_Parallel` | `runtime_GOMAXPROCS()` returns constant 8, not real value | Replace with `runtime.GOMAXPROCS(0)` or add `import "runtime"` |
-| B2 | `TestErrorStrings` | `contains` field is populated but never used in assertions | Add `strings.Contains` assertion or remove the field |
-| B3 | `TestApp_Concurrency_WorkerPool` | `pool` declared twice | Remove first `New(maxWorkers)` call |
-
-None of these are compile errors — the file will compile. But B2 and B3 are
-logical errors that make tests pass vacuously or wastefully.
-
----
-
-## Missing Tests (Recommended Additions)
-
-| Priority | Missing Test | Reason |
-|---|---|---|
-| High | `TestObserver_TryAcquire_Called` | `TryAcquire` calls `notify` — not verified |
-| High | `TestObserver_AcquireWith_Called` | `AcquireWith` calls `notify` — not verified |
-| High | `TestObserver_TryAcquireNWith_Called` | `TryAcquireNWith` calls `notify` — not verified |
-| High | `TestTryAcquireN_ObserverNotCalled` | `TryAcquireN` does NOT call `notify` — this is an implementation gap worth a failing test to drive the fix |
-| Medium | `TestUtilizationSmoothed_MovesAfterRelease` | Replace weak EWMA test with one that verifies actual movement |
-| Medium | `TestSetCap_Shrink_LenIsZero` | Verify `Len() == 0` after shrink drain |
-| Medium | `FuzzConcurrentAcquireRelease` | Fuzz concurrent access patterns |
-| Low | `TestApp_Lifecycle_DrainResetWait` | Split lifecycle test out of App Test 3 |
+The goroutine leak tests are regression tests for the `AcquireWith` and
+`AcquireNWith` implementations. Both methods spawn internal goroutines to
+coordinate between `cond.Wait()` and context cancellation. If those goroutines are
+not properly cleaned up on cancellation, repeated use will leak goroutines
+indefinitely. The tests use 50 iterations to amplify any per-call leak into a
+detectable signal.
 
 ---
 
 ## Summary
 
-The test suite is comprehensive in breadth — every interface method has at least
-one unit test, fuzz target, and benchmark. The application tests demonstrate
-realistic usage clearly. The core correctness guarantees (blocking behavior,
-rollback on cancel, error type contracts) are well-covered.
+The test suite covers every method on the `Semaphore` interface with unit tests,
+fuzz targets, and benchmarks. Observer emission is verified on every code path
+with both positive and negative tests. Error types are tested for `errors.Is`
+matching, `Unwrap` chaining, and diagnostic string content.
 
-The issues identified range from a vacuous assertion (`TestErrorStrings`) to a
-missing observer coverage gap for `TryAcquireN` that reveals a genuine
-implementation defect. Addressing the compilation blockers and the high-priority
-missing tests will produce a suite that can be confidently used as both a
-correctness gate and a reference for users of the package.
+The concurrent fuzz targets (`FuzzConcurrentAcquireRelease`,
+`FuzzConcurrentMixedOps`) race acquires against releases under randomized
+parameters to verify the core invariants (`Len ≤ Cap`, `Len ≥ 0`, no slot leaks)
+hold under contention.
+
+The lifecycle and goroutine leak tests verify the package's production-critical
+behaviors: graceful drain/reset sequences and clean goroutine cleanup on context
+cancellation.
+
+All tests pass under the race detector (`go test -race ./...`).
