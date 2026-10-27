@@ -5,8 +5,8 @@
 > observability hooks your production system actually needs.
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/andreimerlescu/sema.svg)](https://pkg.go.dev/github.com/andreimerlescu/sema)
-[![Go Report Card](https://goreportcard.com/badge/github.com/andreimerlescu/sema)](https://goreportcard.com/report/github.com/andreimerlescu/sema)
 [![Apache 2.0 License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+![Unique](https://counthis.app/github?repository=andreimerlescu/sema&label=Unique) ![Visitors](https://counthis.app/g/qyjy5vwjtjgbjfzy)
 
 ---
 
