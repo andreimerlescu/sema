@@ -2,7 +2,6 @@ package sema
 
 import (
 	"context"
-	"fmt"
 	"math"
 	"time"
 )
@@ -15,23 +14,28 @@ import (
 //
 // Example:
 //
-//	sem := sema.New(3)
+//	sem := sema.Must(3)
 //	sem.Acquire()        // blocks until a slot is available
 //	defer sem.Release()  // always release when done
 //	// ... do guarded work ...
 func (s *semaphore) Acquire() {
 	s.mu.Lock()
-	for {
-		ch := s.channelLocked()
-		select {
-		case ch <- struct{}{}:
-			s.notify(func(o Observer) { o.OnAcquire(len(ch), cap(ch)) })
-			s.mu.Unlock()
-			return
-		default:
-		}
-		// Channel is full — wait for a Release or SetCap to broadcast.
-		s.cond.Wait()
+	if !s.hasSatisfiableWaiterLocked() && s.held+1 <= s.cap {
+		s.held++
+		s.syncAtomicsLocked()
+		s.notify(func(o Observer) { o.OnAcquire(s.held, s.cap) })
+		s.mu.Unlock()
+		return
+	}
+	w := s.enqueueWaiterLocked(1)
+	s.mu.Unlock()
+
+	<-w.ready
+
+	if s.observer != nil {
+		s.mu.Lock()
+		s.notify(func(o Observer) { o.OnAcquire(s.held, s.cap) })
+		s.mu.Unlock()
 	}
 }
 
@@ -51,56 +55,56 @@ func (s *semaphore) Acquire() {
 //	defer sem.Release()
 //	// ... do guarded work ...
 func (s *semaphore) AcquireWith(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ErrAcquireCancelled{Cause: ctx.Err()}
+	default:
+	}
+
 	s.mu.Lock()
-	for {
-		select {
-		case <-ctx.Done():
-			s.mu.Unlock()
-			return ErrAcquireCancelled{Cause: ctx.Err()}
-		default:
-		}
-
-		ch := s.channelLocked()
-		select {
-		case ch <- struct{}{}:
-			s.notify(func(o Observer) { o.OnAcquire(len(ch), cap(ch)) })
-			s.mu.Unlock()
-			return nil
-		default:
-		}
-
-		// Channel is full. We need to wait for a signal while also
-		// watching the context. Spawn a goroutine that does a single
-		// cond.Wait and then exits, so the outer loop can re-check
-		// the (possibly swapped) channel.
-		waitDone := make(chan struct{}, 1)
-		go func() {
-			s.mu.Lock()
-			s.cond.Wait()
-			s.mu.Unlock()
-			waitDone <- struct{}{}
-		}()
-
+	if !s.hasSatisfiableWaiterLocked() && s.held+1 <= s.cap {
+		s.held++
+		s.syncAtomicsLocked()
+		s.notify(func(o Observer) { o.OnAcquire(s.held, s.cap) })
 		s.mu.Unlock()
+		return nil
+	}
+	w := s.enqueueWaiterLocked(1)
+	s.mu.Unlock()
 
-		select {
-		case <-waitDone:
-			// Woken by Broadcast (from Release, SetCap, etc).
-			// Re-check context before re-acquiring the lock.
-			select {
-			case <-ctx.Done():
-				return ErrAcquireCancelled{Cause: ctx.Err()}
-			default:
-			}
+	return s.awaitWaiter(ctx, w)
+}
+
+func (s *semaphore) awaitWaiter(ctx context.Context, w *waiter) error {
+	select {
+	case <-w.ready:
+		if s.observer != nil {
 			s.mu.Lock()
-			continue
-		case <-ctx.Done():
-			// Context cancelled while waiting. Wake the goroutine
-			// so it doesn't leak.
-			s.cond.Broadcast()
-			<-waitDone // wait for goroutine to exit
+			s.notify(func(o Observer) { o.OnAcquire(s.held, s.cap) })
+			s.mu.Unlock()
+		}
+		return nil
+	case <-ctx.Done():
+		s.mu.Lock()
+		if w.granted {
+			// Slots were handed to w right as ctx fired; return them cleanly
+			// unless a Drain/Reset already cleared that generation.
+			if w.grantGen == s.gen {
+				s.held -= w.n
+				if s.held < 0 {
+					s.held = 0
+				}
+				s.syncAtomicsLocked()
+				s.notifyEmptyLocked()
+				s.dispatchLocked()
+			}
+			s.mu.Unlock()
 			return ErrAcquireCancelled{Cause: ctx.Err()}
 		}
+		s.removeWaiterLocked(w)
+		s.dispatchLocked()
+		s.mu.Unlock()
+		return ErrAcquireCancelled{Cause: ctx.Err()}
 	}
 }
 
@@ -135,14 +139,13 @@ func (s *semaphore) AcquireTimeout(d time.Duration) error {
 func (s *semaphore) TryAcquire() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ch := s.channelLocked()
-	select {
-	case ch <- struct{}{}:
-		s.notify(func(o Observer) { o.OnAcquire(len(ch), cap(ch)) })
-		return true
-	default:
+	if s.hasSatisfiableWaiterLocked() || s.held+1 > s.cap {
 		return false
 	}
+	s.held++
+	s.syncAtomicsLocked()
+	s.notify(func(o Observer) { o.OnAcquire(s.held, s.cap) })
+	return true
 }
 
 // TryAcquireWith attempts a non-blocking acquire, but first checks whether
@@ -172,22 +175,21 @@ func (s *semaphore) TryAcquireWith(ctx context.Context) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ch := s.channelLocked()
-	select {
-	case ch <- struct{}{}:
-		s.notify(func(o Observer) { o.OnAcquire(len(ch), cap(ch)) })
-		return nil
-	default:
-		return ErrNoSlot{Requested: 1, Available: cap(ch) - len(ch)}
+	if s.hasSatisfiableWaiterLocked() || s.held+1 > s.cap {
+		return ErrNoSlot{Requested: 1, Available: s.availableLocked()}
 	}
+	s.held++
+	s.syncAtomicsLocked()
+	s.notify(func(o Observer) { o.OnAcquire(s.held, s.cap) })
+	return nil
 }
 
-// Release frees a single slot back to the semaphore, allowing a waiting
-// [semaphore.Acquire] call to proceed. It returns [ErrReleaseExceedsCount]
+// Release frees a single slot back to the semaphore, allowing waiting
+// acquires to proceed in FIFO order. It returns [ErrReleaseExceedsCount]
 // if no slots are currently held.
 //
-// Release also updates the EWMA utilization metric and broadcasts to all
-// waiters.
+// Release also updates the EWMA utilization metric and wakes Wait callers
+// if occupancy reaches zero.
 //
 // Example:
 //
@@ -199,27 +201,24 @@ func (s *semaphore) TryAcquireWith(ctx context.Context) error {
 func (s *semaphore) Release() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ch := s.channelLocked()
-	select {
-	case <-ch:
-		s.notify(func(o Observer) { o.OnRelease(len(ch), cap(ch)) })
-		s.updateEWMA(ch)
-		s.cond.Broadcast()
-		return nil
-	default:
-		return ErrReleaseExceedsCount{Attempted: 1, Current: len(ch)}
+	if s.held < 1 {
+		return ErrReleaseExceedsCount{Attempted: 1, Current: s.held}
 	}
+	s.held--
+	s.syncAtomicsLocked()
+	s.notify(func(o Observer) { o.OnRelease(s.held, s.cap) })
+	s.updateEWMALocked()
+	s.notifyEmptyLocked()
+	s.dispatchLocked()
+	return nil
 }
 
-// AcquireN acquires n slots from the semaphore. It first attempts a fast
-// non-blocking path under a single lock, and falls back to
+// AcquireN acquires n slots from the semaphore atomically. It first attempts
+// a fast non-blocking path under a single lock, and falls back to
 // [semaphore.AcquireNWith] with a 10-minute timeout if that fails.
 //
 // It returns [ErrNExceedsCap] if n is greater than the semaphore capacity,
 // or an error from [validateN] if n is invalid (e.g. n ≤ 0).
-//
-// If the acquisition is partially completed and then fails or times out,
-// all partially acquired slots are rolled back automatically.
 //
 // Example:
 //
@@ -234,16 +233,16 @@ func (s *semaphore) AcquireN(n int) error {
 	if err := validateN(n); err != nil {
 		return err
 	}
-
 	s.mu.Lock()
-	ch := s.channelLocked()
-	if n > cap(ch) {
+	if n > s.cap {
+		c := s.cap
 		s.mu.Unlock()
-		return ErrNExceedsCap{Requested: n, Cap: cap(ch)}
+		return ErrNExceedsCap{Requested: n, Cap: c}
 	}
-	// Fast path: try non-blocking acquire under lock.
-	if s.tryAcquireNLocked(n) {
-		s.notify(func(o Observer) { o.OnAcquire(len(ch), cap(ch)) })
+	if !s.hasSatisfiableWaiterLocked() && s.held+n <= s.cap {
+		s.held += n
+		s.syncAtomicsLocked()
+		s.notify(func(o Observer) { o.OnAcquire(s.held, s.cap) })
 		s.mu.Unlock()
 		return nil
 	}
@@ -254,9 +253,9 @@ func (s *semaphore) AcquireN(n int) error {
 	return s.AcquireNWith(ctx, n)
 }
 
-// AcquireNWith acquires n slots from the semaphore, blocking until all n
-// are claimed or the context is cancelled. Partial acquisitions are rolled
-// back automatically on cancellation or error.
+// AcquireNWith acquires n slots from the semaphore atomically, blocking
+// until all n are claimed or the context is cancelled. No slots are held
+// while waiting, preventing partial-acquisition deadlocks.
 //
 // It returns [ErrNExceedsCap] if n exceeds the semaphore capacity, or
 // [ErrAcquireCancelled] if the context fires before all slots are acquired.
@@ -276,63 +275,29 @@ func (s *semaphore) AcquireNWith(ctx context.Context, n int) error {
 	if err := validateN(n); err != nil {
 		return err
 	}
-
 	s.mu.Lock()
-	ch := s.channelLocked()
-	if n > cap(ch) {
+	if n > s.cap {
+		c := s.cap
 		s.mu.Unlock()
-		return ErrNExceedsCap{Requested: n, Cap: cap(ch)}
+		return ErrNExceedsCap{Requested: n, Cap: c}
 	}
-
-	acquired := 0
-
-	defer func() {
-		// Rollback on any exit where we haven't acquired all n.
-		if acquired > 0 && acquired < n {
-			rollbackCh := s.channelLocked()
-			for j := 0; j < acquired; j++ {
-				select {
-				case <-rollbackCh:
-				default:
-				}
-			}
-			s.cond.Broadcast()
-		}
+	select {
+	case <-ctx.Done():
 		s.mu.Unlock()
-	}()
-
-	for acquired < n {
-		select {
-		case <-ctx.Done():
-			return ErrAcquireCancelled{Cause: ctx.Err()}
-		default:
-		}
-
-		ch = s.channelLocked()
-		select {
-		case ch <- struct{}{}:
-			acquired++
-			continue
-		default:
-		}
-
-		done := make(chan struct{})
-		go func() {
-			select {
-			case <-ctx.Done():
-				s.cond.Broadcast()
-			case <-done:
-			}
-		}()
-
-		s.cond.Wait()
-		close(done)
+		return ErrAcquireCancelled{Cause: ctx.Err()}
+	default:
 	}
+	if !s.hasSatisfiableWaiterLocked() && s.held+n <= s.cap {
+		s.held += n
+		s.syncAtomicsLocked()
+		s.notify(func(o Observer) { o.OnAcquire(s.held, s.cap) })
+		s.mu.Unlock()
+		return nil
+	}
+	w := s.enqueueWaiterLocked(n)
+	s.mu.Unlock()
 
-	ch = s.channelLocked()
-	s.notify(func(o Observer) { o.OnAcquire(len(ch), cap(ch)) })
-	acquired = n // prevent rollback in defer
-	return nil
+	return s.awaitWaiter(ctx, w)
 }
 
 // AcquireNTimeout is a convenience wrapper around [semaphore.AcquireNWith]
@@ -369,15 +334,13 @@ func (s *semaphore) TryAcquireN(n int) bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ch := s.channelLocked()
-	if n > cap(ch) {
+	if n > s.cap || s.hasSatisfiableWaiterLocked() || s.held+n > s.cap {
 		return false
 	}
-	if s.tryAcquireNLocked(n) {
-		s.notify(func(o Observer) { o.OnAcquire(len(ch), cap(ch)) })
-		return true
-	}
-	return false
+	s.held += n
+	s.syncAtomicsLocked()
+	s.notify(func(o Observer) { o.OnAcquire(s.held, s.cap) })
+	return true
 }
 
 // TryAcquireNWith performs a non-blocking multi-slot acquire after first
@@ -405,23 +368,24 @@ func (s *semaphore) TryAcquireNWith(ctx context.Context, n int) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ch := s.channelLocked()
-	if n > cap(ch) {
-		return ErrNExceedsCap{Requested: n, Cap: cap(ch)}
+	if n > s.cap {
+		return ErrNExceedsCap{Requested: n, Cap: s.cap}
 	}
-	if s.tryAcquireNLocked(n) {
-		s.notify(func(o Observer) { o.OnAcquire(len(ch), cap(ch)) })
-		return nil
+	if s.hasSatisfiableWaiterLocked() || s.held+n > s.cap {
+		return ErrNoSlot{Requested: n, Available: s.availableLocked()}
 	}
-	return ErrNoSlot{Requested: n, Available: cap(ch) - len(ch)}
+	s.held += n
+	s.syncAtomicsLocked()
+	s.notify(func(o Observer) { o.OnAcquire(s.held, s.cap) })
+	return nil
 }
 
 // ReleaseN frees n held slots back to the semaphore. It returns
 // [ErrReleaseExceedsCount] if n exceeds the number of currently held
 // slots, or an error from [validateN] if n is invalid.
 //
-// The EWMA utilization metric is updated and all waiters are woken after
-// the release completes.
+// The EWMA utilization metric is updated, Wait callers are woken if
+// occupancy reaches zero, and queued acquires are dispatched in FIFO order.
 //
 // Example:
 //
@@ -436,21 +400,15 @@ func (s *semaphore) ReleaseN(n int) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ch := s.channelLocked()
-	current := len(ch)
-	if n > current {
-		return ErrReleaseExceedsCount{Attempted: n, Current: current}
+	if n > s.held {
+		return ErrReleaseExceedsCount{Attempted: n, Current: s.held}
 	}
-	for i := 0; i < n; i++ {
-		select {
-		case <-ch:
-		default:
-			return ErrReleaseExceedsCount{Attempted: n - i, Current: len(ch)}
-		}
-	}
-	s.notify(func(o Observer) { o.OnRelease(len(ch), cap(ch)) })
-	s.updateEWMA(ch)
-	s.cond.Broadcast()
+	s.held -= n
+	s.syncAtomicsLocked()
+	s.notify(func(o Observer) { o.OnRelease(s.held, s.cap) })
+	s.updateEWMALocked()
+	s.notifyEmptyLocked()
+	s.dispatchLocked()
 	return nil
 }
 
@@ -459,7 +417,7 @@ func (s *semaphore) ReleaseN(n int) error {
 // where you want all in-flight work to finish before proceeding.
 //
 // It returns nil when the semaphore reaches zero, or [ErrAcquireCancelled]
-// if the context fires first.
+// if the context fires first. Wait spawns no helper goroutines.
 //
 // Example:
 //
@@ -478,62 +436,36 @@ func (s *semaphore) Wait(ctx context.Context) error {
 	s.notify(func(o Observer) { o.OnWaitStart() })
 
 	s.mu.Lock()
-	// If already empty, return immediately without spawning a goroutine.
-	if s.IsEmpty() {
+	if s.held == 0 {
 		s.mu.Unlock()
 		s.notify(func(o Observer) { o.OnWaitEnd(nil) })
 		return nil
 	}
-
-	// Use a done channel to coordinate between the waiter goroutine
-	// and context cancellation. The stop flag tells the goroutine to
-	// exit when the context is cancelled, preventing a goroutine leak.
-	done := make(chan struct{})
-	stop := make(chan struct{})
-
-	go func() {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		for !s.IsEmpty() {
-			// Check if we've been told to stop before re-waiting.
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			s.cond.Wait()
-		}
-		close(done)
-	}()
-
-	// We held the lock to check IsEmpty above; release it so the
-	// goroutine can acquire it.
+	if s.emptyCh == nil {
+		s.emptyCh = make(chan struct{})
+	}
+	ch := s.emptyCh
 	s.mu.Unlock()
 
 	select {
-	case <-done:
+	case <-ch:
 		s.notify(func(o Observer) { o.OnWaitEnd(nil) })
 		return nil
 	case <-ctx.Done():
-		// Signal the goroutine to stop, then broadcast to wake it.
-		close(stop)
-		s.cond.Broadcast()
 		err := ErrAcquireCancelled{Cause: ctx.Err()}
 		s.notify(func(o Observer) { o.OnWaitEnd(err) })
 		return err
 	}
 }
 
-// Drain forcibly empties all held slots from the semaphore's internal
-// channel. This does NOT coordinate with goroutines that currently hold
-// slots — they will receive [ErrReleaseExceedsCount] when they
-// subsequently call [semaphore.Release].
+// Drain forcibly clears all held slots from the semaphore. This does NOT
+// coordinate with goroutines that currently hold slots — they will receive
+// [ErrReleaseExceedsCount] when they subsequently call [semaphore.Release].
 //
 // Use [semaphore.Wait] to let in-flight work finish gracefully before
-// calling Drain. The EWMA utilization metric is reset to zero after
-// draining.
-//
-// It returns [ErrDrain] if the channel could not be fully emptied.
+// calling Drain. The EWMA utilization metric is reset to zero, blocked
+// [semaphore.Wait] callers are woken first, and queued acquires are then
+// dispatched.
 //
 // Example:
 //
@@ -547,22 +479,21 @@ func (s *semaphore) Wait(ctx context.Context) error {
 func (s *semaphore) Drain() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.drainLocked()
-	ch := s.channelLocked()
-	if len(ch) != 0 {
-		return ErrDrain{Cause: fmt.Sprintf("channel not empty after drain, len=%d", len(ch))}
-	}
+	s.held = 0
+	s.gen++
+	s.syncAtomicsLocked()
 	s.resetEWMA()
-	s.cond.Broadcast()
+	s.notifyEmptyLocked()
+	s.dispatchLocked()
 	return nil
 }
 
-// Reset replaces the semaphore's internal channel with a fresh one of the
-// same capacity, discarding all held slots. Like [semaphore.Drain],
-// goroutines that hold slots from before the reset will receive
-// [ErrReleaseExceedsCount] on their next [semaphore.Release] call.
+// Reset forcibly clears all held slots while preserving capacity. Like
+// [semaphore.Drain], goroutines that hold slots from before the reset will
+// receive [ErrReleaseExceedsCount] on their next [semaphore.Release] call.
 //
-// The EWMA utilization metric is reset to zero. All waiters are woken.
+// The EWMA utilization metric is reset to zero, blocked [semaphore.Wait]
+// callers are woken, and queued acquires are dispatched.
 //
 // Example:
 //
@@ -572,14 +503,7 @@ func (s *semaphore) Drain() error {
 //	}
 //	fmt.Printf("cap=%d, len=%d\n", sem.Cap(), sem.Len()) // cap=N, len=0
 func (s *semaphore) Reset() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	c := cap(s.channelLocked())
-	ch := newChannel(c)
-	s.ch.Store(&ch)
-	s.resetEWMA()
-	s.cond.Broadcast()
-	return nil
+	return s.Drain()
 }
 
 // Len returns the number of slots currently held (acquired but not yet
@@ -590,7 +514,7 @@ func (s *semaphore) Reset() error {
 //
 //	fmt.Printf("slots in use: %d\n", sem.Len())
 func (s *semaphore) Len() int {
-	return len(s.channel())
+	return int(s.heldAtom.Load())
 }
 
 // Cap returns the total capacity of the semaphore — the maximum number of
@@ -601,12 +525,13 @@ func (s *semaphore) Len() int {
 //
 //	fmt.Printf("max concurrent slots: %d\n", sem.Cap())
 func (s *semaphore) Cap() int {
-	return cap(s.channel())
+	return int(s.capAtom.Load())
 }
 
 // Utilization returns the current instantaneous utilization as a float64
-// in the range [0.0, 1.0], computed as Len() / Cap(). It returns 0 if the
-// capacity is zero.
+// in the range [0.0, 1.0], computed as Len() / Cap() and clamped to 1.0
+// while oversubscribed during a shrink drain. It returns 0 if the capacity
+// is zero.
 //
 // For a smoothed metric that accounts for historical usage, see
 // [semaphore.UtilizationSmoothed].
@@ -616,18 +541,13 @@ func (s *semaphore) Cap() int {
 //	u := sem.Utilization()
 //	fmt.Printf("current utilization: %.1f%%\n", u*100)
 func (s *semaphore) Utilization() float64 {
-	ch := s.channel()
-	c := cap(ch)
-	if c == 0 {
-		return 0
-	}
-	return float64(len(ch)) / float64(c)
+	return clampUtilization(s.Len(), s.Cap())
 }
 
 // UtilizationSmoothed returns the exponentially weighted moving average
-// (EWMA) of utilization as a float64 in [0.0, 1.0]. This value is updated
-// on every [semaphore.Release] and [semaphore.ReleaseN] call, providing a
-// smoothed view of utilization over time.
+// (EWMA) of utilization as a float64 clamped to [0.0, 1.0]. This value is
+// updated on every [semaphore.Release], [semaphore.ReleaseN], and
+// [semaphore.SetCap] call, providing a smoothed view of utilization over time.
 //
 // Example:
 //
@@ -648,7 +568,7 @@ func (s *semaphore) IsEmpty() bool {
 	return s.Len() == 0
 }
 
-// IsFull reports whether all slots in the semaphore are currently held,
+// IsFull reports whether occupancy is at or above capacity (Len >= Cap),
 // meaning any new [semaphore.Acquire] call would block.
 //
 // Example:
@@ -657,19 +577,22 @@ func (s *semaphore) IsEmpty() bool {
 //	    fmt.Println("semaphore at capacity, new acquires will block")
 //	}
 func (s *semaphore) IsFull() bool {
-	return s.Len() == s.Cap()
+	return s.Len() >= s.Cap()
 }
 
 // SetCap dynamically adjusts the semaphore's capacity to c. Passing -1
 // resets the capacity to [defaultCap]. Values less than 1 (other than -1)
 // return [ErrInvalidCap].
 //
-// If the new capacity is greater than or equal to the number of currently
-// held slots, all held slots are preserved. If the new capacity is smaller,
-// the internal channel is drained first (existing holders will receive
-// [ErrReleaseExceedsCount] on their next release).
+// All currently held slots are preserved regardless of whether capacity
+// expands or shrinks. When shrinking below current occupancy, no new slots
+// are granted until occupancy drops below c, and existing holders release
+// normally without [ErrReleaseExceedsCount]. While oversubscribed,
+// [semaphore.IsFull] reports true and utilization metrics remain clamped
+// to [0.0, 1.0].
 //
-// The EWMA metric is updated and all waiters are woken after the resize.
+// The EWMA metric is updated and queued waiters are dispatched in FIFO
+// order as capacity allows.
 //
 // Example:
 //
@@ -678,7 +601,7 @@ func (s *semaphore) IsFull() bool {
 //	    log.Printf("set cap failed: %v", err)
 //	}
 //
-//	// Scale back down.
+//	// Scale back down without interrupting in-flight holders.
 //	if err := sem.SetCap(10); err != nil {
 //	    log.Printf("set cap failed: %v", err)
 //	}
@@ -694,21 +617,9 @@ func (s *semaphore) SetCap(c int) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	oldCh := s.channelLocked()
-	current := len(oldCh)
-	newCh := newChannel(c)
-
-	if c >= current {
-		for i := 0; i < current; i++ {
-			newCh <- struct{}{}
-		}
-	} else {
-		s.drainLocked()
-	}
-
-	s.ch.Store(&newCh)
-	s.updateEWMA(newCh)
-	s.cond.Broadcast()
+	s.cap = c
+	s.syncAtomicsLocked()
+	s.updateEWMALocked()
+	s.dispatchLocked()
 	return nil
 }

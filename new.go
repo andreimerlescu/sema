@@ -1,9 +1,6 @@
 package sema
 
-import (
-	"fmt"
-	"sync"
-)
+import "fmt"
 
 // New creates a new [Semaphore] with the given capacity c, which defines
 // the maximum number of slots that may be held concurrently. The capacity
@@ -65,10 +62,10 @@ func New(c int) (Semaphore, error) {
 	if c < 1 {
 		return nil, ErrInvalidCap{Value: c}
 	}
-	s := &semaphore{}
-	s.cond = sync.NewCond(&s.mu)
-	ch := newChannel(c)
-	s.ch.Store(&ch)
+	s := &semaphore{
+		cap: c,
+	}
+	s.capAtom.Store(int64(c))
 	return s, nil
 }
 

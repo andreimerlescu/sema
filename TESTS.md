@@ -96,7 +96,8 @@ a broken foundation.
 | `TestAcquireWith_Success` | `AcquireWith(ctx)` succeeds on an available slot |
 | `TestAcquireWith_CancelledContext` | Pre-cancelled context returns `ErrAcquireCancelled` immediately |
 | `TestAcquireWith_ContextCancelMidWait` | Context cancelled while blocked returns `ErrAcquireCancelled` |
-| `TestAcquireWith_SurvivesSetCap` | `AcquireWith` retries on the new channel after `SetCap` swaps it mid-acquire |
+| `TestAcquireWith_SurvivesSetCap` | `AcquireWith` wakes cleanly from the FIFO waiter queue when `SetCap` expands capacity |
+| `TestAcquireWith_CancelDuringHandOff_NoSlotLeak` | 32 goroutines hammering short-timeout `AcquireWith` + `Release` leak zero slots |
 | `TestAcquireTimeout_Success` | `AcquireTimeout` succeeds when slot is available |
 | `TestAcquireTimeout_Expires` | `AcquireTimeout` returns `ErrAcquireCancelled` after deadline |
 | `TestTryAcquire_Success` | `TryAcquire()` returns true on an available slot |
@@ -117,19 +118,20 @@ and a 1s window is used to assert the eventual unblock.
 
 `TestAcquireWith_SurvivesSetCap` fills a cap=2 semaphore, starts a blocking
 `AcquireWith` with a 2-second timeout, then calls `SetCap(5)` to expand capacity.
-The test verifies that `AcquireWith` detects the channel swap and successfully
-acquires on the new channel rather than timing out on the stale one.
+The test verifies that `SetCap` dispatches queued waiters cleanly rather than
+leaving them stranded until context expiry.
 
 ### Why
 
 The single-slot API is the most commonly used path. Every context interaction
-(pre-cancelled, mid-wait cancel, timeout expiry) must be tested independently
-because each is handled by a distinct code path in `AcquireWith`.
+(pre-cancelled, mid-wait cancel, cancel during handoff, timeout expiry) must be
+tested independently because each is handled by a distinct code path in
+`AcquireWith` and `awaitWaiter`.
 
-The `SurvivesSetCap` test is critical because `SetCap` replaces the internal
-channel. Any goroutine blocked on the old channel must detect the swap and retry,
-otherwise it silently deadlocks until its context expires. This test catches
-exactly that failure mode.
+The `SurvivesSetCap` test ensures that expanding capacity immediately dispatches
+queued waiters in FIFO order. `TestAcquireWith_CancelDuringHandOff_NoSlotLeak`
+stresses the race between `dispatchLocked()` granting slots and `ctx.Done()`
+firing simultaneously, confirming returned slots are handed back without leaks.
 
 ### Design Notes
 
@@ -153,8 +155,9 @@ unnecessarily.
 | `TestAcquireN_DoesNotBlockForever` | `AcquireN` on a full semaphore unblocks when a slot is released |
 | `TestAcquireNWith_Success` | `AcquireNWith(ctx, 4)` acquires 4 slots |
 | `TestAcquireNWith_ContextCancelled` | Pre-cancelled context returns `ErrAcquireCancelled` |
-| `TestAcquireNWith_RollsBackOnCancel` | Partial acquisition is rolled back when context cancelled mid-wait |
-| `TestAcquireNWith_SurvivesSetCap` | `AcquireNWith` handles channel swap from `SetCap` mid-acquire |
+| `TestAcquireNWith_RollsBackOnCancel` | Cancelled `AcquireNWith` leaves occupancy untouched (no partial slot consumption) |
+| `TestAcquireNWith_NoPartialHoldDeadlock` | Competing `AcquireNWith(3)` callers on cap=5 with 4 free never deadlock each other |
+| `TestAcquireNWith_SurvivesSetCap` | `AcquireNWith` wakes cleanly from the FIFO waiter queue when `SetCap` expands capacity |
 | `TestAcquireNTimeout_Success` | Succeeds within timeout |
 | `TestAcquireNTimeout_Expires` | Returns `ErrAcquireCancelled` on expiry |
 | `TestTryAcquireN_Success` | Returns true when enough slots available |
@@ -171,27 +174,18 @@ unnecessarily.
 
 ### How
 
-`TestAcquireNWith_RollsBackOnCancel` is the most important test in this section.
-It fills 4 of 5 slots, then in a goroutine requests 3 slots (only 1 available).
-The goroutine acquires 1 and blocks waiting for 2 more. After 30ms the context is
-cancelled. The test then asserts both the error type AND that `Len()` returned to
-4, proving the partial acquisition was rolled back.
+`TestAcquireNWith_RollsBackOnCancel` fills 4 of 5 slots, then in a goroutine
+requests 3 slots (only 1 available). Because multi-slot acquisition is atomic
+on the FIFO waiter queue, the waiter claims zero slots while waiting; cancelling
+its context unlinks the waiter and verifies both `ErrAcquireCancelled` and
+`Len() == 4`. `TestAcquireNWith_NoPartialHoldDeadlock` runs two concurrent
+`AcquireNWith(3)` callers on a cap=5 semaphore with 4 free slots to prove they
+serialize atomically instead of deadlocking on partial holds.
 
 ### Why
 
-The rollback behavior is a correctness guarantee of `AcquireNWith`. Without it,
-a cancelled multi-slot acquire would silently consume slots, causing the semaphore
-to report more occupancy than is real. This is the single most critical behavioral
-invariant in the multi-slot API and must be tested explicitly.
-
-### Design Notes
-
-The 30ms sleep before cancel in `TestAcquireNWith_RollsBackOnCancel` is
-load-sensitive. On a very slow machine the goroutine might not have had time to
-acquire the one available slot yet, meaning `Len()` could still be 4 but for the
-wrong reason (nothing was rolled back because nothing was acquired). The test is
-reliable in practice because `AcquireNWith` acquires available slots eagerly before
-blocking for the remainder.
+Atomic multi-slot acquisition guarantees that cancelled or competing bulk
+acquires never leak slots or deadlock each other on partial holds.
 
 ---
 
@@ -211,10 +205,13 @@ blocking for the remainder.
 | `TestUtilizationSmoothed_MovesAfterRelease` | EWMA moves to expected value after releasing with slots still held |
 | `TestUtilizationSmoothed_AccumulatesOverMultipleReleases` | EWMA accumulates correctly over 10 sequential releases |
 | `TestSetCap_Expand` | Growing cap preserves existing slot count |
-| `TestSetCap_Shrink` | Shrinking cap drains slots per spec |
-| `TestSetCap_Shrink_LenIsZero` | `Len() == 0` after shrinking below current occupancy |
-| `TestSetCap_Shrink_ToExactCurrentLen` | Shrinking to exact current `Len()` preserves all slots |
-| `TestSetCap_Shrink_BelowCurrentLen` | Shrinking below current `Len()` drains to zero |
+| `TestSetCap_Shrink` | Shrinking cap updates `Cap()` while preserving held slots |
+| `TestSetCap_Shrink_PreservesHeldSlots` | Shrinking below `Len()` preserves occupancy, clamps `Utilization()` to `1.0`, rejects new acquires with `Available: 0`, and allows clean `Release()` down to zero |
+| `TestSetCap_Shrink_ToExactCurrentLen` | Shrinking to exact current `Len()` preserves all slots and marks `IsFull()` |
+| `TestSetCap_Shrink_BelowCurrentLen_BulkAndMetrics` | Verifies bulk `TryAcquireN`/`TryAcquireNWith`/`ReleaseN` and clamped `[0.0, 1.0]` metrics while oversubscribed |
+| `TestSetCap_ShrinkUnderLoad_StrictCeiling` | 20 active workers shrunk to 4 with 50 contenders: zero new acquires while `>= 4` active, strict ceiling `<= 4` after drain, zero release errors |
+| `TestSetCap_ShrinkThenExpand_UnblocksWaiters` | Queued `AcquireNWith(4)` and `AcquireWith` waiters survive shrink to 3 and unblock cleanly on expand to 12 |
+| `TestSetCap_ShrinkBelowWaitingAcquireN_DoesNotBlockSmallerWaiters` | Shrinking below a queued `AcquireNWith(4)` skips it so a queued 1-slot waiter proceeds without deadlocking, then wakes the 4-slot waiter on later expand |
 | `TestSetCap_Default` | `SetCap(-1)` sets cap to `defaultCap` |
 | `TestSetCap_Invalid` | `SetCap(0)` returns `ErrInvalidCap` |
 | `TestSetCap_UpdatesEWMA` | EWMA is recalculated against new capacity after resize |
@@ -225,7 +222,8 @@ blocking for the remainder.
 | `TestWait_ReturnsWhenEmpty` | `Wait()` returns immediately on empty semaphore |
 | `TestWait_BlocksUntilEmpty` | `Wait()` blocks until all slots released |
 | `TestWait_ContextCancelled` | `Wait()` returns `ErrAcquireCancelled` on context cancel |
-| `TestWait_CancelDoesNotLeakGoroutine` | Cancelling `Wait` does not leave goroutines parked on `cond.Wait()` |
+| `TestWait_CancelDoesNotLeakGoroutine` | Cancelling `Wait` leaves zero leaked goroutines |
+| `TestWait_ZeroGoroutineLeak` | 500 concurrent `Wait(ctx)` calls spawn zero helper goroutines and exit cleanly on cancel/release |
 
 ### How
 
@@ -246,9 +244,12 @@ wrong, rate limiting logic built on top of it will make incorrect decisions.
 `Utilization()` and `UtilizationSmoothed()` are particularly important to verify
 as valid IEEE 754 floats since callers may feed them into dashboards or alerting.
 
-The `SetCap_Shrink` variants cover three distinct code paths in `SetCap`: shrinking
-with no occupancy (trivial), shrinking to exactly current occupancy (slots
-preserved, channel replaced), and shrinking below current occupancy (drain path).
+The `SetCap_Shrink` variants cover every dynamic shrink transition: shrinking to
+exact current occupancy, shrinking below occupancy without draining held slots,
+clamping `Utilization()` / `UtilizationSmoothed()` to `[0.0, 1.0]` and
+`ErrNoSlot.Available` to `0`, enforcing a strict concurrency ceiling under live
+contention, surviving shrink-then-expand with queued waiters, and skipping
+temporarily unsatisfiable `AcquireN` waiters so smaller waiters never deadlock.
 
 ---
 
@@ -339,6 +340,7 @@ silent failures. Testing it explicitly ensures the contract holds through refact
 | `FuzzUtilization` | Random cap and acquired count, verifies float is in [0,1] |
 | `FuzzConcurrentAcquireRelease` | Random cap, goroutine count, and acquire-N size under concurrent access |
 | `FuzzConcurrentMixedOps` | Random cap and goroutine count mixing `TryAcquire` and `AcquireWith` concurrently |
+| `FuzzConcurrentSetCapShrink` | Random mixes of `AcquireWith`, `TryAcquire`, `AcquireNWith`, `Release`, and concurrent `SetCap` shrink/expand verifying clamped `[0,1]` utilization, zero release errors on held slots, and zero slot leaks |
 
 ### How
 
@@ -349,17 +351,21 @@ values to safe ranges (e.g. cap ≤ 1000) to prevent the fuzzer from creating
 channels so large they exhaust memory.
 
 The concurrent fuzz targets (`FuzzConcurrentAcquireRelease`,
-`FuzzConcurrentMixedOps`) launch multiple goroutines under a 500ms context timeout.
-Each goroutine acquires, verifies `Len() <= Cap()` and `Len() >= 0`, then releases.
-After all goroutines complete, the test asserts `Len() == 0` to detect slot leaks.
+`FuzzConcurrentMixedOps`, `FuzzConcurrentSetCapShrink`) launch multiple
+goroutines under bounded timeouts. When capacity is fixed, each goroutine
+verifies `Len() <= Cap()` and `Len() >= 0`; under concurrent `SetCap`
+shrink/expand, `FuzzConcurrentSetCapShrink` verifies `Utilization()` and
+`UtilizationSmoothed()` remain clamped to `[0, 1]` and `Release`/`ReleaseN`
+never fail on held slots. After all goroutines complete, every target asserts
+`Len() == 0` to detect slot leaks.
 
 ### Why
 
 Fuzz tests catch the cases that unit tests miss: unexpected combinations of valid
 inputs that expose ordering dependencies, integer overflow edge cases, or state
-corruption from rapid create/destroy cycles. The semaphore's atomic EWMA and
-channel-swap in `SetCap` are particularly worth fuzzing because they involve
-concurrent state transitions.
+corruption from rapid create/destroy cycles. The semaphore's atomic EWMA, FIFO
+waiter queue handoff, and non-draining `SetCap` shrink/expand transitions are
+particularly worth fuzzing because they involve concurrent state transitions.
 
 The concurrent fuzz targets are especially important because the semaphore's
 correctness under concurrent access is its most critical property. Racing acquires
@@ -431,12 +437,10 @@ that isolated unit tests cannot — for example, a `Reset` that doesn't properly
 broadcast to waiting goroutines, or a `SetCap` after `Drain` that loses the EWMA
 reset.
 
-The goroutine leak tests are regression tests for the `AcquireWith` and
-`AcquireNWith` implementations. Both methods spawn internal goroutines to
-coordinate between `cond.Wait()` and context cancellation. If those goroutines are
-not properly cleaned up on cancellation, repeated use will leak goroutines
-indefinitely. The tests use 50 iterations to amplify any per-call leak into a
-detectable signal.
+The goroutine leak tests (`TestAcquireWith_CancelDoesNotLeakGoroutine`,
+`TestAcquireNWith_CancelDoesNotLeakGoroutine`, `TestWait_ZeroGoroutineLeak`)
+verify that blocking acquires and `Wait(ctx)` spawn zero helper goroutines and
+leave no leaked goroutines across repeated cancellations or high concurrency.
 
 ---
 
@@ -448,12 +452,13 @@ with both positive and negative tests. Error types are tested for `errors.Is`
 matching, `Unwrap` chaining, and diagnostic string content.
 
 The concurrent fuzz targets (`FuzzConcurrentAcquireRelease`,
-`FuzzConcurrentMixedOps`) race acquires against releases under randomized
-parameters to verify the core invariants (`Len ≤ Cap`, `Len ≥ 0`, no slot leaks)
-hold under contention.
+`FuzzConcurrentMixedOps`, `FuzzConcurrentSetCapShrink`) race acquires, releases,
+and dynamic `SetCap` shrink/expand calls under randomized parameters to verify
+the core invariants (`Utilization` in `[0, 1]`, `Len ≥ 0`, zero release errors
+on held slots, and no slot leaks) hold under contention.
 
 The lifecycle and goroutine leak tests verify the package's production-critical
-behaviors: graceful drain/reset sequences and clean goroutine cleanup on context
-cancellation.
+behaviors: graceful drain/reset sequences, non-draining dynamic shrinks, and
+zero helper-goroutine leaks on context cancellation.
 
 All tests pass under the race detector (`go test -race ./...`).

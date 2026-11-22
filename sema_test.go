@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -829,12 +830,15 @@ func TestSetCap_Expand(t *testing.T) {
 func TestSetCap_Shrink(t *testing.T) {
 	s := mustNew(t, 10)
 	_ = s.AcquireN(8)
-	// shrinking drains existing slots per implementation
+	// shrinking preserves existing held slots without draining
 	if err := s.SetCap(3); err != nil {
 		t.Errorf("SetCap(3): unexpected error %v", err)
 	}
 	if s.Cap() != 3 {
 		t.Errorf("Cap() = %d, want 3", s.Cap())
+	}
+	if s.Len() != 8 {
+		t.Errorf("Len() = %d, want 8 (held slots preserved)", s.Len())
 	}
 }
 
@@ -1834,7 +1838,7 @@ func TestUtilizationSmoothed_AccumulatesOverMultipleReleases(t *testing.T) {
 	}
 }
 
-func TestSetCap_Shrink_LenIsZero(t *testing.T) {
+func TestSetCap_Shrink_PreservesHeldSlots(t *testing.T) {
 	s := mustNew(t, 10)
 
 	if err := s.AcquireN(8); err != nil {
@@ -1844,18 +1848,86 @@ func TestSetCap_Shrink_LenIsZero(t *testing.T) {
 		t.Fatalf("pre-shrink Len() = %d, want 8", s.Len())
 	}
 
-	if err := s.SetCap(3); err != nil {
-		t.Fatalf("SetCap(3): %v", err)
+	if err := s.SetCap(4); err != nil {
+		t.Fatalf("SetCap(4): %v", err)
 	}
 
-	if s.Cap() != 3 {
-		t.Errorf("Cap() = %d, want 3 after shrink", s.Cap())
+	if s.Cap() != 4 {
+		t.Errorf("Cap() = %d, want 4 after shrink", s.Cap())
+	}
+	if s.Len() != 8 {
+		t.Errorf("Len() = %d, want 8 (non-draining shrink must preserve held slots)", s.Len())
+	}
+	if s.IsEmpty() {
+		t.Errorf("IsEmpty() = true while 8 slots held, want false")
+	}
+	if !s.IsFull() {
+		t.Errorf("IsFull() = false while oversubscribed (8 >= 4), want true")
+	}
+
+	if u := s.Utilization(); u != 1.0 {
+		t.Errorf("Utilization() = %f while oversubscribed, want clamped 1.0", u)
+	}
+	if us := s.UtilizationSmoothed(); math.IsNaN(us) || us < 0 || us > 1.0 {
+		t.Errorf("UtilizationSmoothed() = %f, want within [0.0, 1.0]", us)
+	}
+
+	if s.TryAcquire() {
+		t.Errorf("TryAcquire() = true while oversubscribed (8 >= 4), want false")
+	}
+	err := s.TryAcquireWith(context.Background())
+	var slotErr ErrNoSlot
+	if !errors.As(err, &slotErr) {
+		t.Fatalf("TryAcquireWith() err = %v, want ErrNoSlot", err)
+	}
+	if slotErr.Requested != 1 || slotErr.Available != 0 {
+		t.Errorf("ErrNoSlot = %+v, want {Requested:1 Available:0}", slotErr)
+	}
+
+	// Release 4 slots (8 -> 4): still full, zero ErrReleaseExceedsCount errors.
+	for i := 0; i < 4; i++ {
+		if err := s.Release(); err != nil {
+			t.Fatalf("Release #%d during shrink drain failed: %v", i+1, err)
+		}
+	}
+	if s.Len() != 4 {
+		t.Errorf("after 4 releases: Len() = %d, want 4", s.Len())
+	}
+	if !s.IsFull() {
+		t.Errorf("after 4 releases: IsFull() = false at 4/4, want true")
+	}
+	if s.TryAcquire() {
+		t.Errorf("after 4 releases: TryAcquire() = true at 4/4, want false")
+	}
+
+	// Release 1 more slot (4 -> 3): now below new cap, acquires succeed.
+	if err := s.Release(); err != nil {
+		t.Fatalf("5th Release failed: %v", err)
+	}
+	if s.Len() != 3 {
+		t.Errorf("after 5th release: Len() = %d, want 3", s.Len())
+	}
+	if s.IsFull() {
+		t.Errorf("after 5th release: IsFull() = true at 3/4, want false")
+	}
+	if !s.TryAcquire() {
+		t.Errorf("TryAcquire() = false at 3/4, want true")
+	}
+	if s.Len() != 4 {
+		t.Errorf("after TryAcquire: Len() = %d, want 4", s.Len())
+	}
+
+	// Release remaining 4 slots: semaphore returns cleanly to empty.
+	for i := 0; i < 4; i++ {
+		if err := s.Release(); err != nil {
+			t.Fatalf("final Release #%d failed: %v", i+1, err)
+		}
 	}
 	if s.Len() != 0 {
-		t.Errorf("Len() = %d, want 0 after shrink drain", s.Len())
+		t.Errorf("final Len() = %d, want 0", s.Len())
 	}
 	if !s.IsEmpty() {
-		t.Errorf("IsEmpty() = false after shrink drain, expected true")
+		t.Errorf("final IsEmpty() = false, want true")
 	}
 }
 
@@ -1881,22 +1953,509 @@ func TestSetCap_Shrink_ToExactCurrentLen(t *testing.T) {
 	}
 }
 
-func TestSetCap_Shrink_BelowCurrentLen(t *testing.T) {
+func TestSetCap_Shrink_BelowCurrentLen_BulkAndMetrics(t *testing.T) {
 	s := mustNew(t, 10)
 
 	if err := s.AcquireN(8); err != nil {
 		t.Fatalf("AcquireN(8): %v", err)
 	}
 
-	if err := s.SetCap(4); err != nil {
-		t.Fatalf("SetCap(4): %v", err)
+	if err := s.SetCap(3); err != nil {
+		t.Fatalf("SetCap(3): %v", err)
 	}
 
-	if s.Cap() != 4 {
-		t.Errorf("Cap() = %d, want 4", s.Cap())
+	if s.Cap() != 3 {
+		t.Errorf("Cap() = %d, want 3", s.Cap())
+	}
+	if s.Len() != 8 {
+		t.Errorf("Len() = %d, want 8", s.Len())
+	}
+	if s.TryAcquireN(1) {
+		t.Errorf("TryAcquireN(1) = true while oversubscribed, want false")
+	}
+	err := s.TryAcquireNWith(context.Background(), 2)
+	var slotErr ErrNoSlot
+	if !errors.As(err, &slotErr) {
+		t.Fatalf("TryAcquireNWith(2) err = %v, want ErrNoSlot", err)
+	}
+	if slotErr.Requested != 2 || slotErr.Available != 0 {
+		t.Errorf("ErrNoSlot = %+v, want {Requested:2 Available:0}", slotErr)
+	}
+
+	// Bulk release while oversubscribed succeeds cleanly and keeps metrics in [0, 1].
+	if err := s.ReleaseN(4); err != nil {
+		t.Fatalf("ReleaseN(4) during shrink drain: %v", err)
+	}
+	if s.Len() != 4 || !s.IsFull() {
+		t.Errorf("after ReleaseN(4): Len()=%d IsFull()=%v, want 4/true", s.Len(), s.IsFull())
+	}
+	if u := s.Utilization(); u != 1.0 {
+		t.Errorf("Utilization() = %f at 4/3, want 1.0", u)
+	}
+	if us := s.UtilizationSmoothed(); math.IsNaN(us) || us < 0 || us > 1.0 {
+		t.Errorf("UtilizationSmoothed() = %f out of [0.0, 1.0]", us)
+	}
+
+	if err := s.ReleaseN(4); err != nil {
+		t.Fatalf("final ReleaseN(4): %v", err)
+	}
+	if !s.IsEmpty() {
+		t.Errorf("IsEmpty() = false after releasing all slots")
+	}
+}
+
+func TestSetCap_ShrinkUnderLoad_StrictCeiling(t *testing.T) {
+	const (
+		initialCap = 20
+		shrunkCap  = 4
+		contenders = 50
+	)
+
+	s := mustNew(t, initialCap)
+
+	var (
+		active        atomic.Int64
+		initialAlive  atomic.Int64
+		peakActive    atomic.Int64
+		postDrainPeak atomic.Int64
+		releaseErrs   atomic.Int64
+		earlyAcquires atomic.Int64
+		contenderMax  atomic.Int64
+	)
+
+	updateMax := func(dst *atomic.Int64, val int64) {
+		for {
+			old := dst.Load()
+			if val <= old {
+				return
+			}
+			if dst.CompareAndSwap(old, val) {
+				return
+			}
+		}
+	}
+
+	// Start 20 active initial holders.
+	releaseChs := make([]chan struct{}, initialCap)
+	var initReady sync.WaitGroup
+	var initDone sync.WaitGroup
+	initReady.Add(initialCap)
+	initDone.Add(initialCap)
+
+	for i := 0; i < initialCap; i++ {
+		releaseChs[i] = make(chan struct{})
+		go func(ch chan struct{}) {
+			defer initDone.Done()
+			s.Acquire()
+			cur := active.Add(1)
+			initialAlive.Add(1)
+			updateMax(&peakActive, cur)
+			initReady.Done()
+
+			<-ch
+
+			initialAlive.Add(-1)
+			active.Add(-1)
+			if err := s.Release(); err != nil {
+				releaseErrs.Add(1)
+			}
+		}(releaseChs[i])
+	}
+
+	initReady.Wait()
+	if s.Len() != initialCap {
+		t.Fatalf("expected %d held before shrink, got %d", initialCap, s.Len())
+	}
+
+	// Shrink ceiling to 4 while all 20 workers remain active.
+	if err := s.SetCap(shrunkCap); err != nil {
+		t.Fatalf("SetCap(%d): %v", shrunkCap, err)
+	}
+
+	// Spawn 50 contending goroutines mixing AcquireWith and TryAcquire.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var contWG sync.WaitGroup
+	contWG.Add(contenders)
+	for i := 0; i < contenders; i++ {
+		useTry := i%2 == 0
+		go func(tryMode bool) {
+			defer contWG.Done()
+			if tryMode {
+				for !s.TryAcquire() {
+					if ctx.Err() != nil {
+						t.Errorf("contender TryAcquire timed out")
+						return
+					}
+					runtime.Gosched()
+					time.Sleep(time.Millisecond)
+				}
+			} else {
+				if err := s.AcquireWith(ctx); err != nil {
+					t.Errorf("contender AcquireWith failed: %v", err)
+					return
+				}
+			}
+
+			rem := initialAlive.Load()
+			cur := active.Add(1)
+			updateMax(&peakActive, cur)
+			updateMax(&contenderMax, cur)
+			if rem >= shrunkCap {
+				earlyAcquires.Add(1)
+			}
+			if rem == 0 {
+				updateMax(&postDrainPeak, cur)
+			}
+
+			// Brief work while holding slot.
+			time.Sleep(2 * time.Millisecond)
+
+			active.Add(-1)
+			if err := s.Release(); err != nil {
+				releaseErrs.Add(1)
+			}
+		}(useTry)
+	}
+
+	// Keep all 20 initial holders active briefly to verify contenders are held back.
+	time.Sleep(20 * time.Millisecond)
+	if got := contenderMax.Load(); got != 0 {
+		t.Errorf("contender acquired while all %d initial holders were active (peak=%d)", initialCap, got)
+	}
+
+	// Gradually release the initial 20 holders.
+	for i := 0; i < initialCap; i++ {
+		close(releaseChs[i])
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	initDone.Wait()
+	contWG.Wait()
+
+	if peak := peakActive.Load(); peak > initialCap {
+		t.Errorf("peak active workers = %d, exceeded initial cap %d", peak, initialCap)
+	}
+	if early := earlyAcquires.Load(); early != 0 {
+		t.Errorf("%d new acquisitions succeeded while >= %d initial holders were still active", early, shrunkCap)
+	}
+	if cm := contenderMax.Load(); cm > shrunkCap {
+		t.Errorf("peak concurrency during/after contender entry = %d, exceeded shrunk cap %d", cm, shrunkCap)
+	}
+	if post := postDrainPeak.Load(); post > shrunkCap {
+		t.Errorf("post-drain peak concurrency = %d, exceeded shrunk cap %d", post, shrunkCap)
+	}
+	if errs := releaseErrs.Load(); errs != 0 {
+		t.Errorf("encountered %d Release() errors, want 0", errs)
 	}
 	if s.Len() != 0 {
-		t.Errorf("Len() = %d, want 0 (drainLocked path)", s.Len())
+		t.Errorf("final Len() = %d, want 0", s.Len())
+	}
+}
+
+func TestSetCap_ShrinkThenExpand_UnblocksWaiters(t *testing.T) {
+	s := mustNew(t, 10)
+	if err := s.AcquireN(8); err != nil {
+		t.Fatalf("AcquireN(8): %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Queue a 4-slot waiter while cap=10 (8+4 > 10, so it blocks).
+	errN := make(chan error, 1)
+	go func() {
+		errN <- s.AcquireNWith(ctx, 4)
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	// Shrink below both held (8) and queued waiter demand (4).
+	if err := s.SetCap(3); err != nil {
+		t.Fatalf("SetCap(3): %v", err)
+	}
+
+	// Queue a 1-slot waiter while oversubscribed (8 >= 3).
+	err1 := make(chan error, 1)
+	go func() {
+		err1 <- s.AcquireWith(ctx)
+	}()
+
+	// Neither waiter should unblock while cap=3 and held=8.
+	select {
+	case err := <-errN:
+		t.Fatalf("AcquireNWith(4) returned early while cap=3: %v", err)
+	case err := <-err1:
+		t.Fatalf("AcquireWith() returned early while cap=3: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	// Expand capacity to 12: 8 + 4 = 12 unblocks the queued AcquireNWith(4).
+	if err := s.SetCap(12); err != nil {
+		t.Fatalf("SetCap(12): %v", err)
+	}
+	select {
+	case err := <-errN:
+		if err != nil {
+			t.Fatalf("AcquireNWith(4) failed after expand: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("AcquireNWith(4) did not unblock after SetCap(12)")
+	}
+
+	// Release the 4 slots so the queued 1-slot waiter acquires cleanly.
+	if err := s.ReleaseN(4); err != nil {
+		t.Fatalf("ReleaseN(4): %v", err)
+	}
+	select {
+	case err := <-err1:
+		if err != nil {
+			t.Fatalf("AcquireWith() failed after expand/release: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("AcquireWith() did not unblock after SetCap(12) and ReleaseN(4)")
+	}
+
+	// Clean up all held slots (8 initial + 1 single waiter).
+	if err := s.Release(); err != nil {
+		t.Fatalf("Release(): %v", err)
+	}
+	if err := s.ReleaseN(8); err != nil {
+		t.Fatalf("ReleaseN(8): %v", err)
+	}
+	if s.Len() != 0 {
+		t.Errorf("final Len() = %d, want 0", s.Len())
+	}
+}
+
+func TestSetCap_ShrinkBelowWaitingAcquireN_DoesNotBlockSmallerWaiters(t *testing.T) {
+	s := mustNew(t, 5)
+	if err := s.AcquireN(5); err != nil {
+		t.Fatalf("AcquireN(5): %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Queue AcquireNWith(4) at head of queue.
+	err4 := make(chan error, 1)
+	go func() {
+		err4 <- s.AcquireNWith(ctx, 4)
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	// Queue AcquireWith() behind AcquireNWith(4).
+	err1 := make(chan error, 1)
+	go func() {
+		err1 <- s.AcquireWith(ctx)
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	// Shrink cap below 4 (to 2).
+	if err := s.SetCap(2); err != nil {
+		t.Fatalf("SetCap(2): %v", err)
+	}
+
+	// Release 4 slots (5 -> 1): 1-slot waiter must proceed without deadlocking behind 4-slot waiter.
+	if err := s.ReleaseN(4); err != nil {
+		t.Fatalf("ReleaseN(4): %v", err)
+	}
+
+	select {
+	case err := <-err1:
+		if err != nil {
+			t.Fatalf("AcquireWith() failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("1-slot waiter deadlocked behind temporarily unsatisfiable 4-slot waiter")
+	}
+
+	// Verify the 4-slot waiter is still waiting while cap=2.
+	select {
+	case err := <-err4:
+		t.Fatalf("AcquireNWith(4) should still be blocked while cap=2, got %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	// Expanding cap back to 6 allows the 4-slot waiter to wake and acquire cleanly (2 + 4 = 6).
+	if err := s.SetCap(6); err != nil {
+		t.Fatalf("SetCap(6): %v", err)
+	}
+	select {
+	case err := <-err4:
+		if err != nil {
+			t.Fatalf("AcquireNWith(4) failed after SetCap(6): %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("AcquireNWith(4) did not wake after SetCap(6)")
+	}
+
+	// Release all 6 slots (1 initial + 1 single + 4 bulk).
+	if err := s.ReleaseN(6); err != nil {
+		t.Fatalf("ReleaseN(6): %v", err)
+	}
+	if s.Len() != 0 {
+		t.Errorf("final Len() = %d, want 0", s.Len())
+	}
+}
+
+func TestAcquireNWith_NoPartialHoldDeadlock(t *testing.T) {
+	s := mustNew(t, 5)
+	if err := s.AcquireN(1); err != nil {
+		t.Fatalf("AcquireN(1): %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			defer wg.Done()
+			if err := s.AcquireNWith(ctx, 3); err != nil {
+				t.Errorf("AcquireNWith(3) failed (partial-hold deadlock?): %v", err)
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+			if err := s.ReleaseN(3); err != nil {
+				t.Errorf("ReleaseN(3): %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if err := s.Release(); err != nil {
+		t.Fatalf("final Release(): %v", err)
+	}
+	if s.Len() != 0 {
+		t.Errorf("final Len() = %d, want 0", s.Len())
+	}
+}
+
+func TestAcquireWith_CancelDuringHandOff_NoSlotLeak(t *testing.T) {
+	const (
+		capacity   = 2
+		goroutines = 32
+	)
+	s := mustNew(t, capacity)
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	var releaseErrs atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for g := 0; g < goroutines; g++ {
+		go func(id int) {
+			defer wg.Done()
+			timeouts := []time.Duration{
+				0,
+				10 * time.Microsecond,
+				50 * time.Microsecond,
+				200 * time.Microsecond,
+				time.Millisecond,
+			}
+			i := 0
+			for time.Now().Before(deadline) {
+				ctx, cancel := context.WithTimeout(context.Background(), timeouts[(id+i)%len(timeouts)])
+				err := s.AcquireWith(ctx)
+				cancel()
+				if err == nil {
+					runtime.Gosched()
+					if relErr := s.Release(); relErr != nil {
+						releaseErrs.Add(1)
+					}
+				}
+				i++
+			}
+		}(g)
+	}
+
+	wg.Wait()
+
+	if errs := releaseErrs.Load(); errs != 0 {
+		t.Errorf("encountered %d Release() errors during handoff stress", errs)
+	}
+	if s.Len() != 0 {
+		t.Errorf("slot leak detected: final Len() = %d, want 0", s.Len())
+	}
+	if !s.TryAcquireN(capacity) {
+		t.Errorf("TryAcquireN(%d) failed after stress (corrupted queue or leaked slot)", capacity)
+	} else {
+		_ = s.ReleaseN(capacity)
+	}
+}
+
+func TestWait_ZeroGoroutineLeak(t *testing.T) {
+	const waiters = 500
+	s := mustNew(t, 5)
+	s.Acquire() // keep non-empty
+
+	runtime.GC()
+	before := runtime.NumGoroutine()
+
+	var started sync.WaitGroup
+	var done sync.WaitGroup
+	started.Add(waiters)
+	done.Add(waiters)
+
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bgCtx := context.Background()
+
+	var cancelErrs atomic.Int64
+	var okWaits atomic.Int64
+
+	for i := 0; i < waiters; i++ {
+		useCancel := i%2 == 0
+		go func(cancellable bool) {
+			defer done.Done()
+			started.Done()
+			if cancellable {
+				if err := s.Wait(cancelCtx); errors.Is(err, ErrAcquireCancelled{}) {
+					cancelErrs.Add(1)
+				} else {
+					t.Errorf("cancelled Wait returned %v, want ErrAcquireCancelled", err)
+				}
+			} else {
+				if err := s.Wait(bgCtx); err == nil {
+					okWaits.Add(1)
+				} else {
+					t.Errorf("Wait returned unexpected error: %v", err)
+				}
+			}
+		}(useCancel)
+	}
+
+	started.Wait()
+	time.Sleep(30 * time.Millisecond)
+
+	// Only the 500 test goroutines themselves should exist — zero helper goroutines per Wait.
+	during := runtime.NumGoroutine()
+	if during > before+waiters+50 {
+		t.Errorf("Wait spawned helper goroutines: before=%d, during=%d (with %d waiters)",
+			before, during, waiters)
+	}
+
+	// Cancel half, then release the held slot to wake the rest.
+	cancel()
+	if err := s.Release(); err != nil {
+		t.Fatalf("Release(): %v", err)
+	}
+
+	done.Wait()
+	time.Sleep(30 * time.Millisecond)
+
+	if cancelErrs.Load() != waiters/2 {
+		t.Errorf("cancelled waits = %d, want %d", cancelErrs.Load(), waiters/2)
+	}
+	if okWaits.Load() != waiters/2 {
+		t.Errorf("successful waits = %d, want %d", okWaits.Load(), waiters/2)
+	}
+
+	after := runtime.NumGoroutine()
+	if after > before+5 {
+		t.Errorf("goroutine leak after Wait: before=%d, after=%d", before, after)
 	}
 }
 
@@ -2023,6 +2582,111 @@ func FuzzConcurrentMixedOps(f *testing.F) {
 		if s.Len() != 0 {
 			t.Errorf("mixed ops: Len()=%d after completion, want 0", s.Len())
 		}
+	})
+}
+
+func FuzzConcurrentSetCapShrink(f *testing.F) {
+	f.Add(10, 3, 12, 8, 20)
+	f.Add(20, 1, 5, 16, 25)
+	f.Add(4, 2, 8, 12, 20)
+	f.Add(8, 8, 4, 10, 15)
+
+	f.Fuzz(func(t *testing.T, initCap, shrinkCap, expandCap, goroutines, ops int) {
+		if initCap < 1 || initCap > 32 {
+			return
+		}
+		if shrinkCap < 1 || shrinkCap > 32 {
+			return
+		}
+		if expandCap < 1 || expandCap > 32 {
+			return
+		}
+		if goroutines < 2 || goroutines > 16 {
+			return
+		}
+		if ops < 1 || ops > 40 {
+			return
+		}
+
+		s, err := New(initCap)
+		if err != nil {
+			t.Fatalf("New(%d): %v", initCap, err)
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(goroutines)
+
+		checkMetrics := func() {
+			u := s.Utilization()
+			if math.IsNaN(u) || u < 0 || u > 1.0 {
+				t.Errorf("Utilization() = %f out of [0, 1]", u)
+			}
+			us := s.UtilizationSmoothed()
+			if math.IsNaN(us) || us < 0 || us > 1.0+1e-9 {
+				t.Errorf("UtilizationSmoothed() = %f out of [0, 1]", us)
+			}
+			if s.Len() < 0 {
+				t.Errorf("Len() = %d < 0", s.Len())
+			}
+		}
+
+		for g := 0; g < goroutines; g++ {
+			go func(id int) {
+				defer wg.Done()
+				for i := 0; i < ops; i++ {
+					switch (id + i) % 5 {
+					case 0:
+						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+						err := s.AcquireWith(ctx)
+						cancel()
+						if err == nil {
+							checkMetrics()
+							if relErr := s.Release(); relErr != nil {
+								t.Errorf("Release() after AcquireWith failed: %v", relErr)
+							}
+						}
+					case 1:
+						if s.TryAcquire() {
+							checkMetrics()
+							if relErr := s.Release(); relErr != nil {
+								t.Errorf("Release() after TryAcquire failed: %v", relErr)
+							}
+						}
+					case 2:
+						n := 1 + ((id + i) % 3)
+						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+						err := s.AcquireNWith(ctx, n)
+						cancel()
+						if err == nil {
+							checkMetrics()
+							if relErr := s.ReleaseN(n); relErr != nil {
+								t.Errorf("ReleaseN(%d) after AcquireNWith failed: %v", n, relErr)
+							}
+						}
+					case 3:
+						if err := s.SetCap(shrinkCap); err != nil {
+							t.Errorf("SetCap(%d): %v", shrinkCap, err)
+						}
+						checkMetrics()
+					case 4:
+						if err := s.SetCap(expandCap); err != nil {
+							t.Errorf("SetCap(%d): %v", expandCap, err)
+						}
+						checkMetrics()
+					}
+				}
+			}(g)
+		}
+
+		wg.Wait()
+
+		if s.Len() != 0 {
+			t.Errorf("after concurrent SetCap shrink/expand: Len()=%d, want 0", s.Len())
+		}
+		if !s.IsEmpty() {
+			t.Errorf("after completion: IsEmpty()=false, want true")
+		}
+		checkMetrics()
 	})
 }
 
