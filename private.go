@@ -5,6 +5,18 @@ import (
 	"math/bits"
 )
 
+const (
+	defaultCap = 10
+	ewmaAlpha  = 0.1
+)
+
+func validateN(n int) error {
+	if n < 1 {
+		return ErrInvalidN{Value: n}
+	}
+	return nil
+}
+
 func clampPriority(p Priority) Priority {
 	if p < PriorityLow {
 		return PriorityLow
@@ -95,6 +107,12 @@ func (s *semaphore) syncAtomicsLocked() {
 	s.capAtom.Store(int64(s.cap))
 }
 
+func (s *semaphore) grantLocked(n int) {
+	s.held += n
+	s.syncAtomicsLocked()
+	s.notify(func(o Observer) { o.OnAcquire(s.held, s.cap) })
+}
+
 func (s *semaphore) setActiveBitLocked(idx int) {
 	bit := uint8(1) << uint(idx)
 	if s.activeMask&bit == 0 {
@@ -111,9 +129,8 @@ func (s *semaphore) clearActiveBitLocked(idx int) {
 	}
 }
 
-// canFitLocked reports whether n slots can be granted without exceeding
-// s.cap or overflowing signed int arithmetic (even when s.cap or n is
-// math.MaxInt). Requires s.mu held, s.held >= 0, s.cap >= 1, n >= 1.
+// canFitLocked checks whether n slots fit without signed-int overflow,
+// even when s.cap or n is math.MaxInt. Requires s.mu held.
 func (s *semaphore) canFitLocked(n int) bool {
 	return s.held <= s.cap && n <= s.cap-s.held
 }
@@ -131,24 +148,15 @@ func clampUtilization(held, capacity int) float64 {
 
 func (s *semaphore) updateEWMALocked() {
 	current := clampUtilization(s.held, s.cap)
-	for {
-		old := math.Float64frombits(s.ewma.Load())
-		next := ewmaAlpha*current + (1-ewmaAlpha)*old
-		if s.ewma.CompareAndSwap(
-			math.Float64bits(old),
-			math.Float64bits(next),
-		) {
-			return
-		}
-	}
+	old := math.Float64frombits(s.ewma.Load())
+	next := ewmaAlpha*current + (1-ewmaAlpha)*old
+	s.ewma.Store(math.Float64bits(next))
 }
 
 func (s *semaphore) resetEWMA() {
 	s.ewma.Store(0)
 }
 
-// hasHigherOrEqualWaiterLocked reports in O(1) whether any satisfiable
-// waiter at priority >= p is queued.
 func (s *semaphore) hasHigherOrEqualWaiterLocked(p Priority) bool {
 	return (s.activeMask & higherOrEqualMask(p)) != 0
 }
@@ -188,9 +196,8 @@ func (s *semaphore) removeWaiterLocked(w *waiter) {
 	}
 }
 
-// parkOversizedLocked moves any active multi-slot waiters whose request
-// exceeds the shrunk s.cap into s.parked so hot-path operations never scan
-// unsatisfiable waiters. Fast-paths in O(1) when s.multiActive == 0.
+// parkOversizedLocked moves active waiters with w.n > s.cap into s.parked
+// so hot-path acquire/release never scan unsatisfiable waiters.
 func (s *semaphore) parkOversizedLocked() {
 	if s.multiActive == 0 {
 		return
@@ -213,9 +220,8 @@ func (s *semaphore) parkOversizedLocked() {
 	}
 }
 
-// unparkEligibleLocked restores parked waiters whose request now fits
-// within the expanded s.cap back into their priority queue in ascending
-// arrival sequence order. Fast-paths in O(1) when s.parked.count == 0.
+// unparkEligibleLocked restores parked waiters with w.n <= s.cap back into
+// their priority queue in ascending arrival seq order.
 func (s *semaphore) unparkEligibleLocked() {
 	if s.parked.count == 0 {
 		return
@@ -237,10 +243,8 @@ func (s *semaphore) unparkEligibleLocked() {
 }
 
 // dispatchLocked wakes satisfiable waiters strictly by highest priority
-// tier (Critical > High > Normal > Low) and FIFO within each tier. Every
-// waiter in s.queues satisfies w.n <= s.cap, so stopping at the first head
-// waiter that cannot yet fit runs in O(1) per granted waiter without ever
-// scanning skipped waiters.
+// tier and FIFO within each tier. Every active waiter satisfies w.n <= s.cap,
+// so stopping at the first head that does not fit is O(1) per woken waiter.
 func (s *semaphore) dispatchLocked() {
 	for s.activeMask != 0 {
 		idx := 31 - bits.LeadingZeros32(uint32(s.activeMask))

@@ -4,7 +4,7 @@ import "fmt"
 
 // New creates a new [Semaphore] with the given capacity c, which defines
 // the maximum number of slots that may be held concurrently. The capacity
-// can be changed later at runtime via [semaphore.SetCap].
+// can be changed later at runtime via [Semaphore.SetCap].
 //
 // The special value -1 may be passed for c to use the package-level
 // [defaultCap]. Any other value less than 1 returns [ErrInvalidCap].
@@ -16,9 +16,9 @@ import "fmt"
 // # Capacity semantics
 //
 // The capacity represents the upper bound on concurrent access. When all
-// c slots are held, calls to [semaphore.Acquire] block and calls to
-// [semaphore.TryAcquire] return false until a slot is freed by
-// [semaphore.Release].
+// c slots are held, calls to [Semaphore.Acquire] block and calls to
+// [Semaphore.TryAcquire] return false until a slot is freed by
+// [Semaphore.Release].
 //
 // # Observability
 //
@@ -85,8 +85,8 @@ func New(c int) (Semaphore, error) {
 //   - [Observer.OnAcquire](len, cap) — called after a slot is
 //     successfully acquired, with the current occupancy and capacity.
 //   - [Observer.OnRelease](len, cap) — called after a slot is released.
-//   - [Observer.OnWaitStart]() — called when [semaphore.Wait] begins.
-//   - [Observer.OnWaitEnd](err) — called when [semaphore.Wait] finishes,
+//   - [Observer.OnWaitStart]() — called when [Semaphore.Wait] begins.
+//   - [Observer.OnWaitEnd](err) — called when [Semaphore.Wait] finishes,
 //     with nil on success or the cancellation error.
 //
 // # Examples

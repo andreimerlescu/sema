@@ -256,27 +256,22 @@ servePremiumRequest(w, r)
 ### Priority scheduling & cooperative preemption (`PrioritySemaphore`)
 
 `PrioritySemaphore` extends `Semaphore` without breaking `v1.x` compatibility.
-Every semaphore returned by `New`, `Must`, or `NewWithObserver` satisfies
-`PrioritySemaphore` (or construct directly via `NewPriority` / `MustPriority`).
-Four fixed tiers (`PriorityLow`, `PriorityNormal`, `PriorityHigh`,
-`PriorityCritical`) provide strict `O(1)` bitmask dispatch with FIFO order
-within each tier.
+Construct one directly via `NewPriority`, or type-assert any existing
+`Semaphore` returned by `New`, `NewWithObserver`, or `Must`
+(`ps, ok := sem.(sema.PrioritySemaphore)`). Four fixed tiers (`PriorityLow`,
+`PriorityNormal`, `PriorityHigh`, `PriorityCritical`) provide strict `O(1)`
+bitmask dispatch with FIFO order within each tier.
 
 ```go
-ps := sema.MustPriority(16)
+ps, err := sema.NewPriority(16)
+if err != nil {
+    return err
+}
 
-// Direct high-priority acquisition:
 if err := ps.AcquireWithPriority(ctx, sema.PriorityCritical); err != nil {
     return err
 }
 defer ps.Release()
-
-// Or propagate priority through existing Semaphore middleware via context:
-ctx = sema.WithPriority(ctx, sema.PriorityHigh)
-if err := sem.AcquireWith(ctx); err != nil {
-    return err
-}
-defer sem.Release()
 ```
 
 > **Priority inversion in Go:** Go's goroutine scheduler does not provide OS
@@ -312,27 +307,22 @@ func onConfigReload(newWorkerCount int) error {
 
 ### Maintenance window
 
-Drain in-flight work, verify idle, perform maintenance, then resume.
+Wait for in-flight work to finish gracefully, force-drain only if stragglers
+exceed the deadline, perform maintenance, then resume.
 
 ```go
-// 1. Signal no new work should start (application-level flag, not shown).
-// 2. Wait for all current slots to drain — or force it.
-if err := sem.Drain(); err != nil {
-    return err
-}
+// 1. Stop dispatching new work (application-level flag, not shown).
 
-// 3. Confirm idle before touching shared resources.
+// 2. Wait for in-flight holders to release gracefully.
 ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 defer cancel()
 if err := sem.Wait(ctx); err != nil {
-    return fmt.Errorf("timed out waiting for idle: %w", err)
+    // 3. Timed out — force-clear any remaining stragglers.
+    _ = sem.Drain()
 }
 
 // 4. Perform maintenance.
 rotateLogs()
-
-// 5. Reset to a guaranteed-clean state and resume.
-sem.Reset()
 ```
 
 ### Utilization monitoring
@@ -400,24 +390,27 @@ sem, err := sema.NewWithObserver(10, &prometheusObserver{
 
 ## Performance
 
-Benchmarks on Apple M3 Ultra (28 cores), Go 1.21, `go test -bench=. -benchmem`:
+Benchmarks on Apple Silicon (`darwin/arm64`, 14 cores), Go 1.24, `make test-bench`:
 
 | Operation | ns/op | allocs/op |
 |---|---:|---:|
-| Acquire + Release | 30 | 0 |
-| TryAcquire + Release | 32 | 0 |
-| AcquireWith + Release | 33 | 0 |
-| AcquireN + ReleaseN | 38 | 0 |
-| Acquire + Release (parallel, 28 cores) | 173 | 0 |
-| Acquire + Release with Observer | 40 | 0 |
-| Len | 2.2 | 0 |
-| Cap | 1.6 | 0 |
-| Utilization | 3.0 | 0 |
-| UtilizationSmoothed | 0.9 | 0 |
+| Acquire + Release | 8.2 | 0 |
+| Acquire + Release (1,000 parked oversized waiters) | 8.3 | 0 |
+| TryAcquire + Release | 9.3 | 0 |
+| AcquireWithPriority + Release | 9.5 | 0 |
+| AcquireWith + Release | 10.1 | 0 |
+| AcquireN + ReleaseN | 14.3 | 0 |
+| Acquire + Release (parallel, 14 cores) | 78.2 | 0 |
+| Acquire + Release with Observer | 29.0 | 0 |
+| SetCap | 11.0 | 0 |
+| HighestWaitingPriority | 0.7 | 0 |
+| Len | 1.6 | 0 |
+| Cap | 1.4 | 0 |
+| Utilization | 2.2 | 0 |
+| UtilizationSmoothed | 1.2 | 0 |
 
-The hot path (acquire/release) is zero-allocation. Observer dispatch adds ~10ns
-when attached and zero cost when no observer is registered. Introspection methods
-(`Len`, `Cap`, `Utilization`, `UtilizationSmoothed`) are lock-free atomic reads.
+All uncontended hot paths, parallel acquire/release, `SetCap`, `Drain`, `Reset`,
+`Wait`, and lock-free introspection methods run with **zero heap allocations**.
 
 ---
 
@@ -473,12 +466,12 @@ also spawning zero helper goroutines even with hundreds of concurrent waiters.
 
 ### Atomic EWMA
 
-`UtilizationSmoothed()` is updated on every `Release`, `ReleaseN`, and `SetCap`
-using a compare-and-swap loop on an `atomic.Uint64` storing the [IEEE 754](https://standards.ieee.org/ieee/754/6210/)
-bits of a `float64`. Instantaneous utilization is clamped to `[0.0, 1.0]` even
-while oversubscribed during a shrink drain. The smoothing factor `α = 0.1` means
-recent activity is weighted lightly, providing a stable trend signal for
-dashboards and autoscalers.
+`UtilizationSmoothed()` is updated under `s.mu` on every `Release`, `ReleaseN`,
+and `SetCap` via an atomic store of the [IEEE 754](https://standards.ieee.org/ieee/754/6210/)
+bits of a `float64` (so lock-free readers observe consistent values).
+Instantaneous utilization is clamped to `[0.0, 1.0]` even while oversubscribed
+during a shrink drain. The smoothing factor `α = 0.1` smooths transient bursts
+for dashboards and autoscalers.
 
 ### Non-draining `SetCap` & `O(1)` parked oversized pool
 
@@ -507,32 +500,28 @@ allocation, and no additional branch in the hot path.
 
 The package ships with comprehensive test coverage across four categories:
 
-**Unit tests** — every interface method on `Semaphore` and `PrioritySemaphore`,
-every error type, every edge case. Constructor validation, strict priority-tier
-ordering, `WithPriority` context interop, `HighestWaitingPriority` transitions,
-`math.MaxInt` overflow boundaries, context cancellation mid-wait and during
-handoff, atomic multi-slot acquisition, observer emission on every code path,
-EWMA correctness, non-draining `SetCap` shrink/expand, and zero-goroutine `Wait`.
+**Unit tests** ([sema_test.go](sema_test.go), [priority_test.go](priority_test.go)) —
+every method on `Semaphore` and `PrioritySemaphore`, error matching/unwrapping,
+strict priority-tier ordering, cooperative yielding via `HighestWaitingPriority`,
+context cancellation mid-wait and during handoff, atomic multi-slot acquisition,
+observer positive/negative emission, EWMA accuracy, non-draining `SetCap`
+shrink/expand, and zero-goroutine `Wait`.
 
 **Fuzz tests** — 10 fuzz targets including `FuzzConcurrentAcquireRelease`,
 `FuzzConcurrentMixedOps`, `FuzzConcurrentSetCapShrink`, and
 `FuzzPrioritySetCapShrink` that race multi-tier acquires, releases, and dynamic
-shrink/expand resizes under randomized parameters to verify invariants
-(`Utilization` in `[0, 1]`, `Len ≥ 0`, internal queue/bitmask integrity, zero
-release errors on held slots, and no slot leaks).
+shrink/expand resizes to verify invariants (`Utilization` in `[0, 1]`, `Len ≥ 0`,
+internal queue/bitmask integrity, zero release errors, and no slot leaks).
 
 **Benchmark tests** — per-operation throughput for every method (including
 `AcquireWithPriority`, lock-free `HighestWaitingPriority`, and `AcquireRelease`
-with 1,000 parked oversized waiters), parallel contention under `GOMAXPROCS`
-cores, and isolated observer overhead measurement.
+with 1,000 parked oversized waiters), parallel contention, and observer overhead.
 
-**Safety-critical lifecycle tests** ([lifecycle_test.go](lifecycle_test.go)) —
-exhaustive state-space transition matrix with structural invariant checks,
-concurrent linearizability & slot-conservation oracle, `O(1)` bounded-latency
-regression with 4,000 parked oversized waiters, and an end-to-end 5-phase
-autonomous control-loop simulation exercising thermal-throttle shrink,
-cooperative `HighestWaitingPriority()` yielding, saturation shedding, recovery
-expansion, and graceful `Wait` shutdown.
+**Lifecycle & invariant tests** ([lifecycle_test.go](lifecycle_test.go)) —
+`math.MaxInt` overflow boundaries, parked/unparked FIFO `seq` preservation,
+a Wing & Gong memoized DFS linearizability history checker
+(`TestLifecycle_Linearizability`), `O(1)` bounded latency with 1,000 parked
+oversized waiters, and end-to-end shrink → shed → recover → `Wait` shutdown.
 
 All tests pass under the race detector (`go test -race ./...`).
 

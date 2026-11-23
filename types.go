@@ -499,18 +499,17 @@ type (
 	//     [context.DeadlineExceeded]).
 	ErrAcquireCancelled struct{ Cause error }
 
-	// ErrDrain indicates that [Semaphore.Drain] could not fully empty
-	// the internal channel. This is an unexpected internal condition
-	// and should not occur under normal usage.
+	// ErrDrain is retained for v1.x API compatibility. In the current
+	// counter-based implementation, [Semaphore.Drain] always succeeds and
+	// does not return ErrDrain.
 	//
 	//   - Cause: a human-readable description of what went wrong.
 	ErrDrain struct{ Cause string }
 
-	// ErrRecovered wraps a panic that was caught and converted to an
-	// error during a multi-slot acquire operation. It preserves both
-	// the raw panic value (which may be any type) and, when possible,
-	// an error-typed version for use with [errors.Unwrap],
-	// [errors.Is], and [errors.As].
+	// ErrRecovered is retained for v1.x API compatibility. It preserves
+	// both a raw panic value and, when possible, an error-typed version
+	// for use with [errors.Unwrap], [errors.Is], and [errors.As]. The
+	// current implementation does not recover panics or return ErrRecovered.
 	//
 	//   - Cause:   the raw value recovered from the panic (any type).
 	//   - AsError: the Cause cast to error, or nil if Cause does not
