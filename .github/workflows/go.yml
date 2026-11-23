@@ -58,6 +58,7 @@ jobs:
           - FuzzConcurrentAcquireRelease
           - FuzzConcurrentMixedOps
           - FuzzConcurrentSetCapShrink
+          - FuzzPrioritySetCapShrink
       fail-fast: false
 
     steps:

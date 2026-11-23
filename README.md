@@ -29,6 +29,7 @@ semaphore is idle so you can shut down cleanly.
 | Non-blocking try-acquire | ✅ | ✅ | ✅ |
 | Dedicated timeout acquire | — | — | ✅ |
 | Dynamic capacity resize | — | ✅ | ✅ |
+| O(1) priority tiers (`PrioritySemaphore`) | — | — | ✅ |
 | Drain / Reset for maintenance | — | — | ✅ |
 | Wait until idle | — | — | ✅ |
 | Instant utilization (`Len/Cap`) | — | — | ✅ |
@@ -252,6 +253,44 @@ defer sem.ReleaseN(premiumWeight)
 servePremiumRequest(w, r)
 ```
 
+### Priority scheduling & cooperative preemption (`PrioritySemaphore`)
+
+`PrioritySemaphore` extends `Semaphore` without breaking `v1.x` compatibility.
+Every semaphore returned by `New`, `Must`, or `NewWithObserver` satisfies
+`PrioritySemaphore` (or construct directly via `NewPriority` / `MustPriority`).
+Four fixed tiers (`PriorityLow`, `PriorityNormal`, `PriorityHigh`,
+`PriorityCritical`) provide strict `O(1)` bitmask dispatch with FIFO order
+within each tier.
+
+```go
+ps := sema.MustPriority(16)
+
+// Direct high-priority acquisition:
+if err := ps.AcquireWithPriority(ctx, sema.PriorityCritical); err != nil {
+    return err
+}
+defer ps.Release()
+
+// Or propagate priority through existing Semaphore middleware via context:
+ctx = sema.WithPriority(ctx, sema.PriorityHigh)
+if err := sem.AcquireWith(ctx); err != nil {
+    return err
+}
+defer sem.Release()
+```
+
+> **Priority inversion in Go:** Go's goroutine scheduler does not provide OS
+> thread priority inheritance on `sync.Mutex`. `PrioritySemaphore` eliminates
+> queue-level priority inversion via strict `O(1)` tier dispatch and provides
+> lock-free `HighestWaitingPriority()` so long-running `PriorityLow` holders
+> can cooperatively checkpoint and yield early:
+>
+> ```go
+> if p, ok := ps.HighestWaitingPriority(); ok && p >= sema.PriorityHigh {
+>     return // checkpoint and release slot early for urgent work
+> }
+> ```
+
 ### Dynamic resize (config reload)
 
 Adjust capacity at runtime without restarting the process.
@@ -412,20 +451,25 @@ if errors.Is(err, sema.ErrAcquireCancelled{}) {
 
 ## Design notes
 
-### Counter core & intrusive FIFO waiter queue
+### Counter core, overflow safety & `O(1)` priority waiter queues
 
 The semaphore tracks occupancy (`held`) and capacity (`cap`) as mutex-guarded
 integers mirrored to `atomic.Int64` fields for lock-free introspection (`Len`,
-`Cap`, `IsEmpty`, `IsFull`, `Utilization`). Blocking acquires (`Acquire`,
-`AcquireWith`, `AcquireN`, `AcquireNWith`) register an intrusive FIFO waiter
-node under the mutex and block on a per-waiter `ready` channel — spawning **zero
-helper goroutines** and eliminating missed wakeups.
+`Cap`, `IsEmpty`, `IsFull`, `Utilization`). All capacity checks use
+subtraction (`held <= cap && n <= cap - held`), preventing signed integer
+overflow even when `Cap()` or `n` reaches `math.MaxInt`.
 
-Multi-slot acquires (`AcquireN`, `AcquireNWith`) wait until all `n` slots are
-available and claim them atomically, eliminating partial-hold deadlocks between
-competing callers. `Wait(ctx)` uses a lazily allocated broadcast channel
-(`emptyCh`) closed whenever occupancy hits zero, also spawning zero helper
-goroutines even with hundreds of concurrent waiters.
+Blocking acquires register an intrusive waiter node into one of four fixed
+priority-tier FIFO queues (`[4]waiterQueue`) indexed by a 4-bit `activeMask`
+(mirrored to `maskAtom` for lock-free `HighestWaitingPriority()`). Admission,
+cancellation, and dispatch run in strict **`O(1)`** via `bits.LeadingZeros32`,
+spawning **zero helper goroutines** and eliminating missed wakeups.
+
+Multi-slot acquires (`AcquireN`, `AcquireNWith`, `AcquireNWithPriority`) wait
+until all `n` slots are available and claim them atomically, eliminating
+partial-hold deadlocks between competing callers. `Wait(ctx)` uses a lazily
+allocated broadcast channel (`emptyCh`) closed whenever occupancy hits zero,
+also spawning zero helper goroutines even with hundreds of concurrent waiters.
 
 ### Atomic EWMA
 
@@ -436,7 +480,7 @@ while oversubscribed during a shrink drain. The smoothing factor `α = 0.1` mean
 recent activity is weighted lightly, providing a stable trend signal for
 dashboards and autoscalers.
 
-### Non-draining `SetCap` safety
+### Non-draining `SetCap` & `O(1)` parked oversized pool
 
 `SetCap` updates capacity in place under the mutex without draining held slots
 or disrupting in-flight holders. When shrinking below current occupancy, `Len()`
@@ -444,11 +488,12 @@ temporarily exceeds `Cap()`, `IsFull()` reports `true`, `ErrNoSlot.Available`
 clamps at `0`, and no new slots are granted until existing holders release below
 the new ceiling.
 
-If a shrink reduces capacity below a queued `AcquireN` waiter's demand, dispatch
-skips that temporarily unsatisfiable waiter so smaller waiters behind it never
-deadlock; once capacity expands back, the skipped waiter wakes cleanly in FIFO
-order. Strict FIFO ordering is preserved among all satisfiable waiters so large
-multi-slot requests are never starved by continuous single-slot arrivals.
+If a shrink reduces capacity below queued multi-slot waiters (`w.n > cap`),
+`SetCap` moves those temporarily unsatisfiable waiters out of the active queues
+into a dedicated `parked` pool so active `Acquire`, `TryAcquire`, `Release`,
+and `Cancel` calls **never scan parked waiters** and remain strictly `O(1)`.
+When capacity later expands back, eligible parked waiters re-enter their tier's
+active queue in original arrival (`seq`) order.
 
 ### Zero observer overhead
 
@@ -462,25 +507,32 @@ allocation, and no additional branch in the hot path.
 
 The package ships with comprehensive test coverage across four categories:
 
-**Unit tests** — every interface method, every error type, every edge case.
-Constructor validation, blocking behavior, context cancellation mid-wait and
-during handoff, atomic multi-slot acquisition, observer emission on every code
-path, EWMA correctness, non-draining `SetCap` shrink/expand, and zero-goroutine
-`Wait`.
+**Unit tests** — every interface method on `Semaphore` and `PrioritySemaphore`,
+every error type, every edge case. Constructor validation, strict priority-tier
+ordering, `WithPriority` context interop, `HighestWaitingPriority` transitions,
+`math.MaxInt` overflow boundaries, context cancellation mid-wait and during
+handoff, atomic multi-slot acquisition, observer emission on every code path,
+EWMA correctness, non-draining `SetCap` shrink/expand, and zero-goroutine `Wait`.
 
-**Fuzz tests** — 9 fuzz targets including `FuzzConcurrentAcquireRelease`,
-`FuzzConcurrentMixedOps`, and `FuzzConcurrentSetCapShrink` that race acquires,
-releases, and dynamic shrink/expand resizes under randomized parameters to
-verify invariants (`Utilization` in `[0, 1]`, `Len ≥ 0`, zero release errors on
-held slots, and no slot leaks).
+**Fuzz tests** — 10 fuzz targets including `FuzzConcurrentAcquireRelease`,
+`FuzzConcurrentMixedOps`, `FuzzConcurrentSetCapShrink`, and
+`FuzzPrioritySetCapShrink` that race multi-tier acquires, releases, and dynamic
+shrink/expand resizes under randomized parameters to verify invariants
+(`Utilization` in `[0, 1]`, `Len ≥ 0`, internal queue/bitmask integrity, zero
+release errors on held slots, and no slot leaks).
 
-**Benchmark tests** — per-operation throughput for every method, parallel
-contention under `GOMAXPROCS` cores, and isolated observer overhead
-measurement.
+**Benchmark tests** — per-operation throughput for every method (including
+`AcquireWithPriority`, lock-free `HighestWaitingPriority`, and `AcquireRelease`
+with 1,000 parked oversized waiters), parallel contention under `GOMAXPROCS`
+cores, and isolated observer overhead measurement.
 
-**Integration tests** — multi-phase lifecycle scenarios covering
-drain → wait → reset → resize → resume sequences and context cancellation
-during drain.
+**Safety-critical lifecycle tests** ([lifecycle_test.go](lifecycle_test.go)) —
+exhaustive state-space transition matrix with structural invariant checks,
+concurrent linearizability & slot-conservation oracle, `O(1)` bounded-latency
+regression with 4,000 parked oversized waiters, and an end-to-end 5-phase
+autonomous control-loop simulation exercising thermal-throttle shrink,
+cooperative `HighestWaitingPriority()` yielding, saturation shedding, recovery
+expansion, and graceful `Wait` shutdown.
 
 All tests pass under the race detector (`go test -race ./...`).
 

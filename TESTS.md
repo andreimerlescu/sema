@@ -341,6 +341,7 @@ silent failures. Testing it explicitly ensures the contract holds through refact
 | `FuzzConcurrentAcquireRelease` | Random cap, goroutine count, and acquire-N size under concurrent access |
 | `FuzzConcurrentMixedOps` | Random cap and goroutine count mixing `TryAcquire` and `AcquireWith` concurrently |
 | `FuzzConcurrentSetCapShrink` | Random mixes of `AcquireWith`, `TryAcquire`, `AcquireNWith`, `Release`, and concurrent `SetCap` shrink/expand verifying clamped `[0,1]` utilization, zero release errors on held slots, and zero slot leaks |
+| `FuzzPrioritySetCapShrink` | Random multi-tier `AcquireWithPriority`, `AcquireNWithPriority`, `TryAcquireWithPriority`, `WithPriority`, `HighestWaitingPriority`, and concurrent `SetCap` shrink/expand verifying full structural invariants and zero slot leaks |
 
 ### How
 
@@ -385,6 +386,9 @@ Every interface method has a single-goroutine benchmark. Additionally:
 | `BenchmarkAcquireRelease_Parallel` | Measures lock contention under `GOMAXPROCS` goroutines |
 | `BenchmarkTryAcquireN_Parallel` | Measures non-blocking path under parallel load |
 | `BenchmarkObserver_Overhead` | Isolates the cost of observer dispatch in the hot path |
+| `BenchmarkAcquireWithPriority` | Measures uncontended `PrioritySemaphore.AcquireWithPriority` + `Release` (0 allocs/op) |
+| `BenchmarkHighestWaitingPriority` | Measures lock-free atomic `HighestWaitingPriority()` snapshot (0 allocs/op) |
+| `BenchmarkAcquireRelease_WithParkedWaiters` | Verifies `O(1)` hot-path latency with 1,000 parked oversized waiters (0 allocs/op) |
 
 ### How
 
@@ -415,6 +419,16 @@ per-operation overhead before choosing this package).
 | `TestApp_Lifecycle_WaitCancelledDuringDrain` | `Wait` returns `ErrAcquireCancelled` when context expires with slots still held, without altering slot count |
 | `TestAcquireWith_CancelDoesNotLeakGoroutine` | 50 rapid cancel cycles on `AcquireWith` do not leak goroutines |
 | `TestAcquireNWith_CancelDoesNotLeakGoroutine` | 50 rapid cancel cycles on `AcquireNWith` do not leak goroutines |
+| `TestPriority_ConstructorsAndString` | Priority constructors, `Semaphore` type assertion, clamping, `String()`, and `WithPriority`/`PriorityFromContext` |
+| `TestPriority_StrictTierOrdering` | Verifies strict `Critical > High > Normal > Low` dispatch and intra-tier FIFO ordering |
+| `TestPriority_WithPriorityContextInterop` | Verifies `WithPriority(ctx, p)` through the `v1.x` `Semaphore` interface |
+| `TestPriority_HigherBypassesLowerMultiSlotWaiter` | Verifies `Critical(1)` bypasses blocked `High(4)` while `High`/`Normal`/`Low` queue behind it |
+| `TestPriority_HighestWaitingPriority` | Lock-free `HighestWaitingPriority()` transitions across enqueue, cancel, park, unpark, and drain |
+| `TestPriority_ObserverEmission` | Positive and negative observer emission tests for all `PrioritySemaphore` methods |
+| `TestLifecycle_StateSpaceTransitions` | Exhaustive transition matrix (`math.MaxInt` overflow boundaries, active/parked seq preservation, cancel, Drain/Reset/Wait) with full internal structural invariant checks |
+| `TestLifecycle_LinearizabilityOracle` | Concurrent multi-tier workload with shadow-state slot conservation, metric bounds, and structural invariants |
+| `TestLifecycle_BoundedMutexLatency` | Proves `O(1)` hot-path latency and zero goroutine leaks with 4,000 parked oversized waiters |
+| `TestLifecycle_AutonomousControlLoop` | 5-phase real-time simulation: nominal → thermal-throttle shrink + cooperative `HighestWaitingPriority()` yielding → saturation shedding → recovery expand → graceful `Wait` shutdown |
 
 ### How
 

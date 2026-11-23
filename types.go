@@ -367,57 +367,84 @@ type Semaphore interface {
 }
 
 type (
-	// waiter is a node in the intrusive doubly-linked FIFO waiter queue
+	// waiterQueue is an intrusive doubly-linked FIFO queue of waiters
+	// guarded by semaphore.mu.
+	waiterQueue struct {
+		head  *waiter
+		tail  *waiter
+		count int
+	}
+
+	// waiter is a node in an intrusive doubly-linked queue (either one of
+	// semaphore's per-priority active queues or its parked oversized pool),
 	// guarded by semaphore.mu.
 	waiter struct {
 		n        int
+		prio     Priority
+		seq      uint64
 		ready    chan struct{}
 		granted  bool
 		grantGen uint64
+		parked   bool
 		prev     *waiter
 		next     *waiter
 	}
 
-	// semaphore is the concrete, unexported implementation of the
-	// [Semaphore] interface. It tracks occupancy and capacity with
-	// mutex-guarded integer counters mirrored to atomics for lock-free
-	// introspection, and coordinates blocking acquires via an intrusive
-	// FIFO waiter queue without spawning helper goroutines.
+	// semaphore is the concrete, unexported implementation of both the
+	// [Semaphore] and [PrioritySemaphore] interfaces. It tracks occupancy
+	// and capacity with mutex-guarded integer counters mirrored to atomics
+	// for lock-free introspection, and coordinates blocking acquires via
+	// four O(1) priority-indexed intrusive FIFO queues plus a parked pool
+	// for temporarily oversized multi-slot waiters without spawning helper
+	// goroutines.
 	//
 	// Fields:
-	//   - mu:       guards held, cap, gen, head, tail, and emptyCh.
-	//   - held:     number of slots currently held (may exceed cap while
-	//               draining down after a SetCap shrink).
-	//   - cap:      current target capacity (>= 1).
-	//   - gen:      generation counter incremented by Drain/Reset so a
-	//               racing cancellation after grant cannot subtract from
-	//               post-drain occupancy.
-	//   - head:     oldest queued waiter in the FIFO waiter list.
-	//   - tail:     newest queued waiter in the FIFO waiter list.
-	//   - emptyCh:  lazily allocated broadcast channel closed and nilled
-	//               whenever held reaches zero to wake Wait callers.
-	//   - heldAtom: lock-free atomic mirror of held for Len/IsEmpty/IsFull/Utilization.
-	//   - capAtom:  lock-free atomic mirror of cap for Cap/IsFull/Utilization.
-	//   - ewma:     stores the smoothed utilization as a uint64-encoded
-	//               float64 (via [math.Float64bits] / [math.Float64frombits]).
-	//               Updated on Release, ReleaseN, and SetCap; read lock-free
-	//               by [Semaphore.UtilizationSmoothed].
-	//   - observer: optional [Observer] receiving lifecycle callbacks.
-	//               Nil when created via [New] or [Must]; set by
-	//               [NewWithObserver]. Checked on every acquire/release
-	//               but incurs no overhead when nil.
+	//   - mu:          guards held, cap, gen, nextSeq, queues, activeMask,
+	//                  multiActive, parked, and emptyCh.
+	//   - held:        number of slots currently held (may exceed cap while
+	//                  draining down after a SetCap shrink).
+	//   - cap:         current target capacity (>= 1).
+	//   - gen:         generation counter incremented by Drain/Reset so a
+	//                  racing cancellation after grant cannot subtract from
+	//                  post-drain occupancy.
+	//   - nextSeq:     monotonically increasing sequence number assigned on
+	//                  enqueue so unparked waiters restore FIFO order.
+	//   - queues:      per-priority intrusive FIFO queues containing only
+	//                  satisfiable waiters (w.n <= cap).
+	//   - activeMask:  4-bit bitmask of non-empty entries in queues.
+	//   - multiActive: count of active waiters with w.n > 1, allowing O(1)
+	//                  shrink fast-path when no multi-slot waiters exist.
+	//   - parked:      pool of waiters whose w.n > cap after a shrink,
+	//                  keeping hot-path acquire/release strictly O(1).
+	//   - emptyCh:     lazily allocated broadcast channel closed and nilled
+	//                  whenever held reaches zero to wake Wait callers.
+	//   - heldAtom:    lock-free atomic mirror of held for Len/IsEmpty/IsFull/Utilization.
+	//   - capAtom:     lock-free atomic mirror of cap for Cap/IsFull/Utilization.
+	//   - maskAtom:    lock-free atomic mirror of activeMask for HighestWaitingPriority.
+	//   - ewma:        stores the smoothed utilization as a uint64-encoded
+	//                  float64 (via [math.Float64bits] / [math.Float64frombits]).
+	//                  Updated on Release, ReleaseN, and SetCap; read lock-free
+	//                  by [Semaphore.UtilizationSmoothed].
+	//   - observer:    optional [Observer] receiving lifecycle callbacks.
+	//                  Nil when created via [New] or [Must]; set by
+	//                  [NewWithObserver]. Checked on every acquire/release
+	//                  but incurs no overhead when nil.
 	semaphore struct {
-		mu       sync.Mutex
-		held     int
-		cap      int
-		gen      uint64
-		head     *waiter
-		tail     *waiter
-		emptyCh  chan struct{}
-		heldAtom atomic.Int64
-		capAtom  atomic.Int64
-		ewma     atomic.Uint64
-		observer Observer
+		mu          sync.Mutex
+		held        int
+		cap         int
+		gen         uint64
+		nextSeq     uint64
+		queues      [numPriorities]waiterQueue
+		activeMask  uint8
+		multiActive int
+		parked      waiterQueue
+		emptyCh     chan struct{}
+		heldAtom    atomic.Int64
+		capAtom     atomic.Int64
+		maskAtom    atomic.Uint32
+		ewma        atomic.Uint64
+		observer    Observer
 	}
 
 	// ErrInvalidCap indicates that an invalid capacity was passed to

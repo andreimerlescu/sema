@@ -3,6 +3,7 @@ package sema
 import (
 	"context"
 	"math"
+	"math/bits"
 	"time"
 )
 
@@ -10,7 +11,7 @@ import (
 // It will wait indefinitely if no slots are free. Use [semaphore.AcquireWith]
 // or [semaphore.AcquireTimeout] if you need cancellation or a deadline.
 //
-// Acquire is safe for concurrent use.
+// Acquire runs at [PriorityNormal] and is safe for concurrent use.
 //
 // Example:
 //
@@ -20,14 +21,14 @@ import (
 //	// ... do guarded work ...
 func (s *semaphore) Acquire() {
 	s.mu.Lock()
-	if !s.hasSatisfiableWaiterLocked() && s.held+1 <= s.cap {
+	if !s.hasHigherOrEqualWaiterLocked(PriorityNormal) && s.canFitLocked(1) {
 		s.held++
 		s.syncAtomicsLocked()
 		s.notify(func(o Observer) { o.OnAcquire(s.held, s.cap) })
 		s.mu.Unlock()
 		return
 	}
-	w := s.enqueueWaiterLocked(1)
+	w := s.enqueueWaiterLocked(1, PriorityNormal)
 	s.mu.Unlock()
 
 	<-w.ready
@@ -42,6 +43,10 @@ func (s *semaphore) Acquire() {
 // AcquireWith blocks until a slot is available or the provided context is
 // cancelled/expired. It returns nil on success, or [ErrAcquireCancelled]
 // if the context fires before a slot becomes available.
+//
+// When contended, AcquireWith honors any [Priority] attached to ctx via
+// [WithPriority] (defaulting to [PriorityNormal]) with zero lookup cost on
+// the uncontended fast path.
 //
 // Example:
 //
@@ -62,14 +67,48 @@ func (s *semaphore) AcquireWith(ctx context.Context) error {
 	}
 
 	s.mu.Lock()
-	if !s.hasSatisfiableWaiterLocked() && s.held+1 <= s.cap {
+	if s.activeMask == 0 && s.canFitLocked(1) {
 		s.held++
 		s.syncAtomicsLocked()
 		s.notify(func(o Observer) { o.OnAcquire(s.held, s.cap) })
 		s.mu.Unlock()
 		return nil
 	}
-	w := s.enqueueWaiterLocked(1)
+	p := PriorityFromContext(ctx)
+	if !s.hasHigherOrEqualWaiterLocked(p) && s.canFitLocked(1) {
+		s.held++
+		s.syncAtomicsLocked()
+		s.notify(func(o Observer) { o.OnAcquire(s.held, s.cap) })
+		s.mu.Unlock()
+		return nil
+	}
+	w := s.enqueueWaiterLocked(1, p)
+	s.mu.Unlock()
+
+	return s.awaitWaiter(ctx, w)
+}
+
+// AcquireWithPriority blocks until a slot is available at priority tier p
+// or ctx is cancelled. Waiters are admitted strictly by priority tier
+// (Critical > High > Normal > Low) and FIFO within each tier.
+func (s *semaphore) AcquireWithPriority(ctx context.Context, p Priority) error {
+	select {
+	case <-ctx.Done():
+		return ErrAcquireCancelled{Cause: ctx.Err()}
+	default:
+	}
+
+	p = clampPriority(p)
+
+	s.mu.Lock()
+	if !s.hasHigherOrEqualWaiterLocked(p) && s.canFitLocked(1) {
+		s.held++
+		s.syncAtomicsLocked()
+		s.notify(func(o Observer) { o.OnAcquire(s.held, s.cap) })
+		s.mu.Unlock()
+		return nil
+	}
+	w := s.enqueueWaiterLocked(1, p)
 	s.mu.Unlock()
 
 	return s.awaitWaiter(ctx, w)
@@ -125,8 +164,9 @@ func (s *semaphore) AcquireTimeout(d time.Duration) error {
 	return s.AcquireWith(ctx)
 }
 
-// TryAcquire attempts to acquire a single slot without blocking. It returns
-// true if a slot was claimed, or false if the semaphore is currently full.
+// TryAcquire attempts to acquire a single slot without blocking at
+// [PriorityNormal]. It returns true if a slot was claimed, or false if the
+// semaphore is full or a Normal-or-higher waiter is queued.
 //
 // Example:
 //
@@ -139,7 +179,7 @@ func (s *semaphore) AcquireTimeout(d time.Duration) error {
 func (s *semaphore) TryAcquire() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.hasSatisfiableWaiterLocked() || s.held+1 > s.cap {
+	if s.hasHigherOrEqualWaiterLocked(PriorityNormal) || !s.canFitLocked(1) {
 		return false
 	}
 	s.held++
@@ -151,7 +191,8 @@ func (s *semaphore) TryAcquire() bool {
 // TryAcquireWith attempts a non-blocking acquire, but first checks whether
 // the provided context has already been cancelled. It returns nil on success,
 // [ErrAcquireCancelled] if the context is done, or [ErrNoSlot] if no slot
-// is available.
+// is available. When contended, any [Priority] attached via [WithPriority]
+// is honored.
 //
 // Example:
 //
@@ -175,7 +216,34 @@ func (s *semaphore) TryAcquireWith(ctx context.Context) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.hasSatisfiableWaiterLocked() || s.held+1 > s.cap {
+	if s.activeMask == 0 && s.canFitLocked(1) {
+		s.held++
+		s.syncAtomicsLocked()
+		s.notify(func(o Observer) { o.OnAcquire(s.held, s.cap) })
+		return nil
+	}
+	p := PriorityFromContext(ctx)
+	if s.hasHigherOrEqualWaiterLocked(p) || !s.canFitLocked(1) {
+		return ErrNoSlot{Requested: 1, Available: s.availableLocked()}
+	}
+	s.held++
+	s.syncAtomicsLocked()
+	s.notify(func(o Observer) { o.OnAcquire(s.held, s.cap) })
+	return nil
+}
+
+// TryAcquireWithPriority attempts a non-blocking single-slot acquire at
+// priority p after checking ctx.Done().
+func (s *semaphore) TryAcquireWithPriority(ctx context.Context, p Priority) error {
+	select {
+	case <-ctx.Done():
+		return ErrAcquireCancelled{Cause: ctx.Err()}
+	default:
+	}
+	p = clampPriority(p)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.hasHigherOrEqualWaiterLocked(p) || !s.canFitLocked(1) {
 		return ErrNoSlot{Requested: 1, Available: s.availableLocked()}
 	}
 	s.held++
@@ -185,8 +253,8 @@ func (s *semaphore) TryAcquireWith(ctx context.Context) error {
 }
 
 // Release frees a single slot back to the semaphore, allowing waiting
-// acquires to proceed in FIFO order. It returns [ErrReleaseExceedsCount]
-// if no slots are currently held.
+// acquires to proceed by priority tier (FIFO within each tier). It returns
+// [ErrReleaseExceedsCount] if no slots are currently held.
 //
 // Release also updates the EWMA utilization metric and wakes Wait callers
 // if occupancy reaches zero.
@@ -213,9 +281,10 @@ func (s *semaphore) Release() error {
 	return nil
 }
 
-// AcquireN acquires n slots from the semaphore atomically. It first attempts
-// a fast non-blocking path under a single lock, and falls back to
-// [semaphore.AcquireNWith] with a 10-minute timeout if that fails.
+// AcquireN acquires n slots from the semaphore atomically at [PriorityNormal].
+// It first attempts a fast non-blocking path under a single lock, and falls
+// back to [semaphore.AcquireNWithPriority] with a 10-minute timeout if that
+// fails.
 //
 // It returns [ErrNExceedsCap] if n is greater than the semaphore capacity,
 // or an error from [validateN] if n is invalid (e.g. n ≤ 0).
@@ -239,7 +308,7 @@ func (s *semaphore) AcquireN(n int) error {
 		s.mu.Unlock()
 		return ErrNExceedsCap{Requested: n, Cap: c}
 	}
-	if !s.hasSatisfiableWaiterLocked() && s.held+n <= s.cap {
+	if !s.hasHigherOrEqualWaiterLocked(PriorityNormal) && s.canFitLocked(n) {
 		s.held += n
 		s.syncAtomicsLocked()
 		s.notify(func(o Observer) { o.OnAcquire(s.held, s.cap) })
@@ -250,12 +319,13 @@ func (s *semaphore) AcquireN(n int) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	return s.AcquireNWith(ctx, n)
+	return s.AcquireNWithPriority(ctx, n, PriorityNormal)
 }
 
 // AcquireNWith acquires n slots from the semaphore atomically, blocking
 // until all n are claimed or the context is cancelled. No slots are held
-// while waiting, preventing partial-acquisition deadlocks.
+// while waiting, preventing partial-acquisition deadlocks. When contended,
+// any [Priority] attached via [WithPriority] is honored.
 //
 // It returns [ErrNExceedsCap] if n exceeds the semaphore capacity, or
 // [ErrAcquireCancelled] if the context fires before all slots are acquired.
@@ -287,14 +357,54 @@ func (s *semaphore) AcquireNWith(ctx context.Context, n int) error {
 		return ErrAcquireCancelled{Cause: ctx.Err()}
 	default:
 	}
-	if !s.hasSatisfiableWaiterLocked() && s.held+n <= s.cap {
+	if s.activeMask == 0 && s.canFitLocked(n) {
 		s.held += n
 		s.syncAtomicsLocked()
 		s.notify(func(o Observer) { o.OnAcquire(s.held, s.cap) })
 		s.mu.Unlock()
 		return nil
 	}
-	w := s.enqueueWaiterLocked(n)
+	p := PriorityFromContext(ctx)
+	if !s.hasHigherOrEqualWaiterLocked(p) && s.canFitLocked(n) {
+		s.held += n
+		s.syncAtomicsLocked()
+		s.notify(func(o Observer) { o.OnAcquire(s.held, s.cap) })
+		s.mu.Unlock()
+		return nil
+	}
+	w := s.enqueueWaiterLocked(n, p)
+	s.mu.Unlock()
+
+	return s.awaitWaiter(ctx, w)
+}
+
+// AcquireNWithPriority atomically acquires n slots at priority tier p,
+// blocking until all n slots are available or ctx is cancelled.
+func (s *semaphore) AcquireNWithPriority(ctx context.Context, n int, p Priority) error {
+	if err := validateN(n); err != nil {
+		return err
+	}
+	p = clampPriority(p)
+	s.mu.Lock()
+	if n > s.cap {
+		c := s.cap
+		s.mu.Unlock()
+		return ErrNExceedsCap{Requested: n, Cap: c}
+	}
+	select {
+	case <-ctx.Done():
+		s.mu.Unlock()
+		return ErrAcquireCancelled{Cause: ctx.Err()}
+	default:
+	}
+	if !s.hasHigherOrEqualWaiterLocked(p) && s.canFitLocked(n) {
+		s.held += n
+		s.syncAtomicsLocked()
+		s.notify(func(o Observer) { o.OnAcquire(s.held, s.cap) })
+		s.mu.Unlock()
+		return nil
+	}
+	w := s.enqueueWaiterLocked(n, p)
 	s.mu.Unlock()
 
 	return s.awaitWaiter(ctx, w)
@@ -316,9 +426,9 @@ func (s *semaphore) AcquireNTimeout(n int, d time.Duration) error {
 	return s.AcquireNWith(ctx, n)
 }
 
-// TryAcquireN attempts to acquire n slots without blocking. It returns true
-// only if all n slots were claimed atomically; otherwise it returns false
-// and no slots are held.
+// TryAcquireN attempts to acquire n slots without blocking at
+// [PriorityNormal]. It returns true only if all n slots were claimed
+// atomically; otherwise it returns false and no slots are held.
 //
 // Example:
 //
@@ -334,7 +444,7 @@ func (s *semaphore) TryAcquireN(n int) bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if n > s.cap || s.hasSatisfiableWaiterLocked() || s.held+n > s.cap {
+	if n > s.cap || s.hasHigherOrEqualWaiterLocked(PriorityNormal) || !s.canFitLocked(n) {
 		return false
 	}
 	s.held += n
@@ -347,7 +457,8 @@ func (s *semaphore) TryAcquireN(n int) bool {
 // checking whether the context is already cancelled. It returns nil if all
 // n slots were claimed, [ErrAcquireCancelled] if the context is done,
 // [ErrNExceedsCap] if n exceeds capacity, or [ErrNoSlot] if not enough
-// slots are free.
+// slots are free. When contended, any [Priority] attached via [WithPriority]
+// is honored.
 //
 // Example:
 //
@@ -371,7 +482,14 @@ func (s *semaphore) TryAcquireNWith(ctx context.Context, n int) error {
 	if n > s.cap {
 		return ErrNExceedsCap{Requested: n, Cap: s.cap}
 	}
-	if s.hasSatisfiableWaiterLocked() || s.held+n > s.cap {
+	if s.activeMask == 0 && s.canFitLocked(n) {
+		s.held += n
+		s.syncAtomicsLocked()
+		s.notify(func(o Observer) { o.OnAcquire(s.held, s.cap) })
+		return nil
+	}
+	p := PriorityFromContext(ctx)
+	if s.hasHigherOrEqualWaiterLocked(p) || !s.canFitLocked(n) {
 		return ErrNoSlot{Requested: n, Available: s.availableLocked()}
 	}
 	s.held += n
@@ -380,12 +498,51 @@ func (s *semaphore) TryAcquireNWith(ctx context.Context, n int) error {
 	return nil
 }
 
+// TryAcquireNWithPriority performs a non-blocking atomic n-slot acquire at
+// priority p after checking ctx.Done().
+func (s *semaphore) TryAcquireNWithPriority(ctx context.Context, n int, p Priority) error {
+	if err := validateN(n); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ErrAcquireCancelled{Cause: ctx.Err()}
+	default:
+	}
+	p = clampPriority(p)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n > s.cap {
+		return ErrNExceedsCap{Requested: n, Cap: s.cap}
+	}
+	if s.hasHigherOrEqualWaiterLocked(p) || !s.canFitLocked(n) {
+		return ErrNoSlot{Requested: n, Available: s.availableLocked()}
+	}
+	s.held += n
+	s.syncAtomicsLocked()
+	s.notify(func(o Observer) { o.OnAcquire(s.held, s.cap) })
+	return nil
+}
+
+// HighestWaitingPriority reports the highest priority tier among currently
+// queued satisfiable waiters, or (PriorityNormal, false) if none are queued.
+// It is a lock-free O(1) atomic read.
+func (s *semaphore) HighestWaitingPriority() (Priority, bool) {
+	mask := uint8(s.maskAtom.Load())
+	if mask == 0 {
+		return PriorityNormal, false
+	}
+	idx := 31 - bits.LeadingZeros32(uint32(mask))
+	return bucketPriority(idx), true
+}
+
 // ReleaseN frees n held slots back to the semaphore. It returns
 // [ErrReleaseExceedsCount] if n exceeds the number of currently held
 // slots, or an error from [validateN] if n is invalid.
 //
 // The EWMA utilization metric is updated, Wait callers are woken if
-// occupancy reaches zero, and queued acquires are dispatched in FIFO order.
+// occupancy reaches zero, and queued acquires are dispatched in priority
+// order (FIFO within each tier).
 //
 // Example:
 //
@@ -587,12 +744,13 @@ func (s *semaphore) IsFull() bool {
 // All currently held slots are preserved regardless of whether capacity
 // expands or shrinks. When shrinking below current occupancy, no new slots
 // are granted until occupancy drops below c, and existing holders release
-// normally without [ErrReleaseExceedsCount]. While oversubscribed,
-// [semaphore.IsFull] reports true and utilization metrics remain clamped
-// to [0.0, 1.0].
+// normally without [ErrReleaseExceedsCount]. Queued multi-slot waiters whose
+// demand temporarily exceeds c are moved to a parked pool so active
+// acquire/release operations stay O(1), and are restored in original arrival
+// order if capacity later expands back.
 //
-// The EWMA metric is updated and queued waiters are dispatched in FIFO
-// order as capacity allows.
+// The EWMA metric is updated and queued waiters are dispatched in priority
+// order (FIFO within each tier) as capacity allows.
 //
 // Example:
 //
@@ -617,7 +775,13 @@ func (s *semaphore) SetCap(c int) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	oldCap := s.cap
 	s.cap = c
+	if c < oldCap {
+		s.parkOversizedLocked()
+	} else if c > oldCap {
+		s.unparkEligibleLocked()
+	}
 	s.syncAtomicsLocked()
 	s.updateEWMALocked()
 	s.dispatchLocked()
