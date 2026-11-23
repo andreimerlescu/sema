@@ -2,7 +2,7 @@ package sema
 
 import "fmt"
 
-// ErrInvalidCap is returned by [semaphore.SetCap] when the requested
+// ErrInvalidCap is returned by [Semaphore.SetCap] when the requested
 // capacity is less than 1 and not the special value -1 (which resets to
 // [defaultCap]).
 //
@@ -30,7 +30,7 @@ func (e ErrInvalidCap) Is(target error) bool {
 	return ok
 }
 
-// ErrInvalidN is returned by [semaphore.AcquireN], [semaphore.ReleaseN],
+// ErrInvalidN is returned by [Semaphore.AcquireN], [Semaphore.ReleaseN],
 // and related multi-slot methods when n is less than 1.
 //
 // The Value field contains the invalid n that was passed.
@@ -56,11 +56,11 @@ func (e ErrInvalidN) Is(target error) bool {
 	return ok
 }
 
-// ErrReleaseExceedsCount is returned by [semaphore.Release] and
-// [semaphore.ReleaseN] when the caller attempts to release more slots
+// ErrReleaseExceedsCount is returned by [Semaphore.Release] and
+// [Semaphore.ReleaseN] when the caller attempts to release more slots
 // than are currently held. This typically indicates a mismatched
-// acquire/release pair, or a release after [semaphore.Drain] or
-// [semaphore.Reset] has already cleared the slots.
+// acquire/release pair, or a release after [Semaphore.Drain] or
+// [Semaphore.Reset] has already cleared the slots.
 //
 //   - Attempted: the number of slots the caller tried to release.
 //   - Current:   the number of slots actually held at the time of the call.
@@ -89,8 +89,8 @@ func (e ErrReleaseExceedsCount) Is(target error) bool {
 	return ok
 }
 
-// ErrNoSlot is returned by [semaphore.TryAcquireWith] and
-// [semaphore.TryAcquireNWith] when the semaphore does not have enough
+// ErrNoSlot is returned by [Semaphore.TryAcquireWith] and
+// [Semaphore.TryAcquireNWith] when the semaphore does not have enough
 // free slots to satisfy a non-blocking acquire.
 //
 //   - Requested: the number of slots the caller asked for.
@@ -118,8 +118,8 @@ func (e ErrNoSlot) Is(target error) bool {
 }
 
 // ErrAcquireCancelled is returned by context-aware acquire methods
-// ([semaphore.AcquireWith], [semaphore.AcquireNWith],
-// [semaphore.AcquireTimeout], etc.) when the context is cancelled or
+// ([Semaphore.AcquireWith], [Semaphore.AcquireNWith],
+// [Semaphore.AcquireTimeout], etc.) when the context is cancelled or
 // its deadline expires before a slot can be acquired.
 //
 // The Cause field holds the underlying context error (typically
@@ -161,18 +161,9 @@ func (e ErrAcquireCancelled) Is(target error) bool {
 	return ok
 }
 
-// ErrDrain is returned by [semaphore.Drain] when the internal channel
-// could not be fully emptied. The Cause field contains a human-readable
-// description of what went wrong.
-//
-// Example:
-//
-//	if err := sem.Drain(); err != nil {
-//	    var drainErr sema.ErrDrain
-//	    if errors.As(err, &drainErr) {
-//	        fmt.Printf("drain problem: %s\n", drainErr.Cause)
-//	    }
-//	}
+// ErrDrain is retained for v1.x API compatibility. In the current
+// counter-based implementation, [Semaphore.Drain] always succeeds and
+// does not return ErrDrain.
 func (e ErrDrain) String() string { return fmt.Sprintf("sema: drain error: %s", e.Cause) }
 
 // Error implements the [error] interface.
@@ -184,25 +175,9 @@ func (e ErrDrain) Is(target error) bool {
 	return ok
 }
 
-// ErrRecovered is returned when [semaphore.AcquireN] (or a related
-// method) catches a panic during execution and wraps it as an error.
-//
-//   - Cause:   the raw value recovered from the panic (interface{}).
-//   - AsError: the Cause converted to an error, if possible, for use
-//     with [errors.Unwrap].
-//
-// ErrRecovered implements [errors.Unwrap] via AsError, so callers can
-// use [errors.Is] and [errors.As] to inspect the original panic value
-// when it satisfies the error interface.
-//
-// Example:
-//
-//	if err := sem.AcquireN(2); err != nil {
-//	    var recErr sema.ErrRecovered
-//	    if errors.As(err, &recErr) {
-//	        fmt.Printf("panic recovered: %v\n", recErr.Cause)
-//	    }
-//	}
+// ErrRecovered is retained for v1.x API compatibility. It wraps a panic
+// value and implements [errors.Unwrap] via AsError, though the current
+// implementation does not recover panics or emit ErrRecovered.
 func (e ErrRecovered) String() string {
 	return fmt.Sprintf("sema: recovered from panic in AcquireN: %v", e.Cause)
 }
@@ -220,8 +195,8 @@ func (e ErrRecovered) Is(target error) bool {
 	return ok
 }
 
-// ErrNExceedsCap is returned by [semaphore.AcquireN],
-// [semaphore.AcquireNWith], and related multi-slot methods when the
+// ErrNExceedsCap is returned by [Semaphore.AcquireN],
+// [Semaphore.AcquireNWith], and related multi-slot methods when the
 // requested count n exceeds the semaphore's current capacity. Acquiring
 // more slots than the capacity would block forever, so the call is
 // rejected immediately.

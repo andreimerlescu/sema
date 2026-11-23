@@ -1748,8 +1748,8 @@ func TestObserver_TryAcquireNWith_NotCalled_WhenCancelled(t *testing.T) {
 	}
 }
 
-// TestTryAcquireN_ObserverNotCalled — now passes because TryAcquireN
-// calls s.notify after a successful tryAcquireNLocked.
+// TestTryAcquireN_ObserverNotCalled verifies that a successful TryAcquireN
+// fires OnAcquire exactly once on the observer.
 func TestTryAcquireN_ObserverNotCalled(t *testing.T) {
 	obs := &mockObserver{}
 	s, err := NewWithObserver(10, obs)
@@ -1763,17 +1763,9 @@ func TestTryAcquireN_ObserverNotCalled(t *testing.T) {
 	}
 
 	if obs.AcquireCount() != 1 {
-		t.Errorf(
-			"OnAcquire called %d times after TryAcquireN(3), want 1 — "+
-				"TryAcquireN does not call s.notify(); this is an implementation gap",
-			obs.AcquireCount(),
-		)
+		t.Errorf("OnAcquire called %d times after TryAcquireN(3), want 1", obs.AcquireCount())
 	}
 }
-
-// ============================================================
-// MISSING TESTS — MEDIUM PRIORITY
-// ============================================================
 
 func TestUtilizationSmoothed_MovesAfterRelease(t *testing.T) {
 	s := mustNew(t, 5)
@@ -2459,10 +2451,6 @@ func TestWait_ZeroGoroutineLeak(t *testing.T) {
 	}
 }
 
-// ============================================================
-// MISSING TESTS — FUZZ: CONCURRENT ACCESS
-// ============================================================
-
 func FuzzConcurrentAcquireRelease(f *testing.F) {
 	f.Add(5, 10, 1)
 	f.Add(1, 3, 1)
@@ -2689,10 +2677,6 @@ func FuzzConcurrentSetCapShrink(f *testing.F) {
 		checkMetrics()
 	})
 }
-
-// ============================================================
-// MISSING TESTS — LOW PRIORITY
-// ============================================================
 
 func TestApp_Lifecycle_DrainResetWait(t *testing.T) {
 	const (

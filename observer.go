@@ -29,8 +29,8 @@ package sema
 //
 //   - [Observer.OnAcquire] — a slot was successfully acquired.
 //   - [Observer.OnRelease] — a slot was successfully released.
-//   - [Observer.OnWaitStart] — a call to [semaphore.Wait] has begun.
-//   - [Observer.OnWaitEnd] — a call to [semaphore.Wait] has finished.
+//   - [Observer.OnWaitStart] — a call to [Semaphore.Wait] has begun.
+//   - [Observer.OnWaitEnd] — a call to [Semaphore.Wait] has finished.
 //
 // # Examples
 //
@@ -89,19 +89,19 @@ package sema
 //	func (a *asyncObserver) OnWaitEnd(err error) {}
 type Observer interface {
 	// OnAcquire is called immediately after a slot is successfully
-	// acquired by any of the acquire methods ([semaphore.Acquire],
-	// [semaphore.AcquireWith], [semaphore.TryAcquire],
-	// [semaphore.AcquireN], etc.).
+	// acquired by any of the acquire methods ([Semaphore.Acquire],
+	// [Semaphore.AcquireWith], [Semaphore.TryAcquire],
+	// [Semaphore.AcquireN], etc.).
 	//
 	// Parameters:
 	//   - count: the number of slots currently held after this
-	//     acquisition (equivalent to [semaphore.Len] at call time).
+	//     acquisition (equivalent to [Semaphore.Len] at call time).
 	//   - cap: the total capacity of the semaphore (equivalent to
-	//     [semaphore.Cap] at call time).
+	//     [Semaphore.Cap] at call time).
 	//
 	// The ratio count/cap gives the instantaneous utilization at the
 	// moment of acquisition. Note that for bulk acquires via
-	// [semaphore.AcquireN], OnAcquire is called once after all n slots
+	// [Semaphore.AcquireN], OnAcquire is called once after all n slots
 	// have been claimed, not once per slot.
 	//
 	// Example usage inside an implementation:
@@ -113,16 +113,16 @@ type Observer interface {
 	OnAcquire(count, cap int)
 
 	// OnRelease is called immediately after one or more slots are
-	// successfully released by [semaphore.Release] or
-	// [semaphore.ReleaseN].
+	// successfully released by [Semaphore.Release] or
+	// [Semaphore.ReleaseN].
 	//
 	// Parameters:
 	//   - count: the number of slots still held after this release
-	//     (equivalent to [semaphore.Len] at call time).
+	//     (equivalent to [Semaphore.Len] at call time).
 	//   - cap: the total capacity of the semaphore (equivalent to
-	//     [semaphore.Cap] at call time).
+	//     [Semaphore.Cap] at call time).
 	//
-	// Like OnAcquire, for bulk releases via [semaphore.ReleaseN],
+	// Like OnAcquire, for bulk releases via [Semaphore.ReleaseN],
 	// OnRelease is called once after all n slots have been freed, not
 	// once per slot.
 	//
@@ -135,7 +135,7 @@ type Observer interface {
 	//	}
 	OnRelease(count, cap int)
 
-	// OnWaitStart is called at the beginning of [semaphore.Wait],
+	// OnWaitStart is called at the beginning of [Semaphore.Wait],
 	// before the semaphore checks whether it is already empty. This
 	// allows observers to track how often callers enter a wait state
 	// and to measure wait duration by pairing with [Observer.OnWaitEnd].
@@ -152,7 +152,7 @@ type Observer interface {
 	//	}
 	OnWaitStart()
 
-	// OnWaitEnd is called when [semaphore.Wait] returns, whether it
+	// OnWaitEnd is called when [Semaphore.Wait] returns, whether it
 	// completed successfully (all slots drained) or was cancelled by
 	// the context.
 	//
