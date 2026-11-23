@@ -64,8 +64,10 @@ then `Drain` and `Reset` for a clean restart. No leaked goroutines, no
 abandoned connections.
 
 **Config-driven concurrency with hot reload** — call `SetCap` when your config
-file changes. The semaphore resizes live, preserving in-flight work when
-expanding and draining when shrinking.
+file changes. The semaphore resizes live without draining in-flight work:
+expanding immediately dispatches queued waiters, and shrinking lets existing
+holders finish and release cleanly while holding back new acquires until
+occupancy drops below the new ceiling.
 
 **Autoscaler feedback loop** — feed `UtilizationSmoothed()` into your scaling
 logic. The EWMA smooths out bursts so your autoscaler doesn't thrash on
@@ -146,17 +148,17 @@ type Semaphore interface {
 
     // ── Lifecycle ───────────────────────────────────────────────────────
     Wait(ctx context.Context) error            // block until Len() == 0
-    Drain() error                              // forcibly empty all slots
-    Reset() error                              // replace channel; preserves Cap
-    SetCap(c int) error                        // resize at runtime
+    Drain() error                              // forcibly clear all held slots
+    Reset() error                              // forcibly clear slots; preserves Cap
+    SetCap(c int) error                        // non-draining resize at runtime
 
     // ── Introspection ───────────────────────────────────────────────────
     Len() int                                  // current occupancy
     Cap() int                                  // current capacity
-    Utilization() float64                      // Len/Cap snapshot
-    UtilizationSmoothed() float64              // EWMA of Len/Cap over time
+    Utilization() float64                      // clamped Len/Cap snapshot in [0.0, 1.0]
+    UtilizationSmoothed() float64              // EWMA of clamped Len/Cap in [0.0, 1.0]
     IsEmpty() bool
-    IsFull() bool
+    IsFull() bool                              // true when Len() >= Cap()
 }
 ```
 
@@ -260,10 +262,14 @@ func onConfigReload(newWorkerCount int) error {
 }
 ```
 
-> **Expanding** (new cap ≥ current occupancy): existing slots are preserved
-> and the channel grows.
-> **Shrinking** (new cap < current occupancy): all slots are drained first,
-> then the channel shrinks. Plan accordingly.
+> **Expanding** (new cap ≥ current occupancy): all held slots are preserved and
+> queued waiters are dispatched in FIFO order.
+> **Shrinking** (new cap < current occupancy): all held slots are preserved
+> without draining. Existing holders finish and call `Release()` cleanly without
+> `ErrReleaseExceedsCount`, while new acquires block (or fail for `Try*`) until
+> occupancy drops below the new capacity. While oversubscribed (`Len() > Cap()`),
+> `IsFull()` returns `true` and `Utilization()` / `UtilizationSmoothed()` remain
+> clamped to `[0.0, 1.0]`.
 
 ### Maintenance window
 
@@ -406,26 +412,43 @@ if errors.Is(err, sema.ErrAcquireCancelled{}) {
 
 ## Design notes
 
-### Channel-based core
+### Counter core & intrusive FIFO waiter queue
 
-The semaphore is backed by a buffered `chan struct{}`. Acquiring a slot sends
-to the channel; releasing receives from it. This delegates scheduling to the
-Go runtime's existing channel machinery — no spin loops, no custom queues.
+The semaphore tracks occupancy (`held`) and capacity (`cap`) as mutex-guarded
+integers mirrored to `atomic.Int64` fields for lock-free introspection (`Len`,
+`Cap`, `IsEmpty`, `IsFull`, `Utilization`). Blocking acquires (`Acquire`,
+`AcquireWith`, `AcquireN`, `AcquireNWith`) register an intrusive FIFO waiter
+node under the mutex and block on a per-waiter `ready` channel — spawning **zero
+helper goroutines** and eliminating missed wakeups.
+
+Multi-slot acquires (`AcquireN`, `AcquireNWith`) wait until all `n` slots are
+available and claim them atomically, eliminating partial-hold deadlocks between
+competing callers. `Wait(ctx)` uses a lazily allocated broadcast channel
+(`emptyCh`) closed whenever occupancy hits zero, also spawning zero helper
+goroutines even with hundreds of concurrent waiters.
 
 ### Atomic EWMA
 
-`UtilizationSmoothed()` is updated on every `Release` / `ReleaseN` using a
-compare-and-swap loop on an `atomic.Uint64` storing the [IEEE 754](https://standards.ieee.org/ieee/754/6210/) bits of a
-`float64`. The smoothing factor `α = 0.1` means recent activity is weighted
-lightly, providing a stable trend signal for dashboards and autoscalers.
+`UtilizationSmoothed()` is updated on every `Release`, `ReleaseN`, and `SetCap`
+using a compare-and-swap loop on an `atomic.Uint64` storing the [IEEE 754](https://standards.ieee.org/ieee/754/6210/)
+bits of a `float64`. Instantaneous utilization is clamped to `[0.0, 1.0]` even
+while oversubscribed during a shrink drain. The smoothing factor `α = 0.1` means
+recent activity is weighted lightly, providing a stable trend signal for
+dashboards and autoscalers.
 
-### SetCap safety
+### Non-draining `SetCap` safety
 
-`SetCap` holds the mutex for the full duration of the channel swap. Goroutines
-blocked on `Acquire` will unblock via `cond.Broadcast()` after the swap
-completes and will find the new channel. Expanding preserves current occupancy;
-shrinking drains first. There is no "safe resize while goroutines are mid-acquire"
-— plan maintenance windows accordingly using `Wait` or `Drain`.
+`SetCap` updates capacity in place under the mutex without draining held slots
+or disrupting in-flight holders. When shrinking below current occupancy, `Len()`
+temporarily exceeds `Cap()`, `IsFull()` reports `true`, `ErrNoSlot.Available`
+clamps at `0`, and no new slots are granted until existing holders release below
+the new ceiling.
+
+If a shrink reduces capacity below a queued `AcquireN` waiter's demand, dispatch
+skips that temporarily unsatisfiable waiter so smaller waiters behind it never
+deadlock; once capacity expands back, the skipped waiter wakes cleanly in FIFO
+order. Strict FIFO ordering is preserved among all satisfiable waiters so large
+multi-slot requests are never starved by continuous single-slot arrivals.
 
 ### Zero observer overhead
 
@@ -440,13 +463,16 @@ allocation, and no additional branch in the hot path.
 The package ships with comprehensive test coverage across four categories:
 
 **Unit tests** — every interface method, every error type, every edge case.
-Constructor validation, blocking behavior, context cancellation mid-wait,
-partial-acquire rollback, observer emission on every code path, EWMA
-correctness, and `SetCap` channel-swap survival.
+Constructor validation, blocking behavior, context cancellation mid-wait and
+during handoff, atomic multi-slot acquisition, observer emission on every code
+path, EWMA correctness, non-draining `SetCap` shrink/expand, and zero-goroutine
+`Wait`.
 
-**Fuzz tests** — 8 fuzz targets including `FuzzConcurrentAcquireRelease` and
-`FuzzConcurrentMixedOps` that race acquires against releases under randomized
-parameters to verify invariants (`Len ≤ Cap`, `Len ≥ 0`, no slot leaks).
+**Fuzz tests** — 9 fuzz targets including `FuzzConcurrentAcquireRelease`,
+`FuzzConcurrentMixedOps`, and `FuzzConcurrentSetCapShrink` that race acquires,
+releases, and dynamic shrink/expand resizes under randomized parameters to
+verify invariants (`Utilization` in `[0, 1]`, `Len ≥ 0`, zero release errors on
+held slots, and no slot leaks).
 
 **Benchmark tests** — per-operation throughput for every method, parallel
 contention under `GOMAXPROCS` cores, and isolated observer overhead

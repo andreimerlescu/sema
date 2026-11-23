@@ -10,25 +10,28 @@ import (
 // Semaphore is a concurrency primitive that limits the number of
 // goroutines accessing a shared resource or performing work
 // simultaneously. It operates as a counting semaphore backed by a
-// channel, with support for context-aware acquisition, bulk
-// acquire/release, dynamic capacity changes, graceful draining, and
+// mutex-guarded counter and an intrusive FIFO waiter queue, with
+// support for context-aware acquisition, atomic bulk acquire/release,
+// non-draining dynamic capacity changes, graceful draining, and
 // real-time utilization metrics.
 //
 // Create a Semaphore with [New], [NewWithObserver], or [Must].
 //
 // # Core concept
 //
-// A Semaphore manages a fixed pool of slots. A goroutine claims a slot
-// by acquiring it and returns the slot by releasing it. When all slots
-// are held, further acquires block (or fail, for try-variants) until a
-// slot is freed. The number of slots is the semaphore's capacity,
-// which can be adjusted at runtime via [Semaphore.SetCap].
+// A Semaphore manages a pool of slots. A goroutine claims a slot by
+// acquiring it and returns the slot by releasing it. When all slots
+// are held, further acquires block in FIFO order (or fail, for
+// try-variants) until slots are freed. The number of slots is the
+// semaphore's capacity, which can be adjusted at runtime via
+// [Semaphore.SetCap].
 //
 // # Concurrency safety
 //
 // All methods on Semaphore are safe for concurrent use from multiple
-// goroutines. The implementation uses a combination of a mutex,
-// condition variable, and atomic operations to coordinate access.
+// goroutines. The implementation uses a mutex, an intrusive FIFO
+// waiter queue, and atomic mirrors to coordinate access without
+// spawning helper goroutines.
 //
 // # Method groups
 //
@@ -53,9 +56,9 @@ import (
 //
 // ## Multi-slot (bulk) acquisition
 //
-// These methods acquire or attempt to acquire n slots at once. Partial
-// acquisitions are rolled back automatically on failure or cancellation,
-// so the semaphore is never left in a half-acquired state:
+// These methods acquire or attempt to acquire n slots atomically, so
+// competing multi-slot callers cannot deadlock on partial holds and
+// the semaphore is never left in a half-acquired state:
 //
 //   - [Semaphore.AcquireN] — blocks until n slots are available (with a
 //     10-minute internal timeout), or returns [ErrNExceedsCap] if n
@@ -77,12 +80,12 @@ import (
 //   - [Semaphore.Wait] — blocks until the semaphore is completely empty
 //     (all slots released) or the context is cancelled. Useful for
 //     waiting on in-flight work before shutting down.
-//   - [Semaphore.Drain] — forcibly removes all held slots from the
-//     internal channel. Goroutines that previously acquired slots will
+//   - [Semaphore.Drain] — forcibly clears all held slots and resets the
+//     EWMA to zero. Goroutines that previously acquired slots will
 //     receive [ErrReleaseExceedsCount] on their next Release call.
 //     Prefer calling Wait first to let in-flight work finish gracefully.
-//   - [Semaphore.Reset] — replaces the internal channel with a fresh one
-//     of the same capacity, discarding all held slots. Same caveats as
+//   - [Semaphore.Reset] — forcibly clears all held slots while
+//     preserving capacity, resetting the EWMA to zero. Same caveats as
 //     Drain regarding in-flight goroutines.
 //
 // ## Introspection
@@ -95,20 +98,24 @@ import (
 //   - [Semaphore.Len] — number of slots currently held.
 //   - [Semaphore.Cap] — total capacity (maximum concurrent slots).
 //   - [Semaphore.Utilization] — instantaneous utilization as a float64
-//     in [0.0, 1.0], computed as Len / Cap.
+//     in [0.0, 1.0], computed as Len / Cap and clamped to 1.0 while
+//     oversubscribed during a shrink drain.
 //   - [Semaphore.UtilizationSmoothed] — exponentially weighted moving
-//     average of utilization, updated on each Release/ReleaseN call.
-//     Provides a smoothed view of usage over time for adaptive
-//     concurrency control or capacity planning.
+//     average of utilization in [0.0, 1.0], updated on each Release,
+//     ReleaseN, and SetCap call. Provides a smoothed view of usage over
+//     time for adaptive concurrency control or capacity planning.
 //   - [Semaphore.IsEmpty] — true when no slots are held (Len == 0).
-//   - [Semaphore.IsFull] — true when all slots are held (Len == Cap).
+//   - [Semaphore.IsFull] — true when occupancy is at or above capacity
+//     (Len >= Cap).
 //
 // ## Dynamic capacity
 //
 //   - [Semaphore.SetCap] — adjusts the semaphore's capacity at runtime.
-//     Pass -1 to reset to [defaultCap]. If the new capacity is smaller
-//     than the current occupancy, existing slots are drained. All
-//     blocked acquires are re-evaluated after a capacity change.
+//     Pass -1 to reset to [defaultCap]. Shrinking below current
+//     occupancy preserves all held slots without draining; no new slots
+//     are granted until occupancy drops below the new capacity, and
+//     existing holders release normally without [ErrReleaseExceedsCount].
+//     Blocked acquires are dispatched in FIFO order as capacity allows.
 //
 // # Acquire/release pairing
 //
@@ -245,25 +252,25 @@ type Semaphore interface {
 	// The EWMA utilization metric is updated on each successful release.
 	Release() error
 
-	// AcquireN acquires n slots from the semaphore, blocking until all n
-	// are available. It first attempts a fast non-blocking path and falls
-	// back to [Semaphore.AcquireNWith] with a 10-minute internal timeout.
-	// Returns [ErrNExceedsCap] if n exceeds the capacity (which would
-	// deadlock), or [ErrInvalidN] if n < 1. Partial acquisitions are
-	// rolled back automatically on failure.
+	// AcquireN acquires n slots from the semaphore atomically, blocking
+	// until all n are available. It first attempts a fast non-blocking
+	// path and falls back to [Semaphore.AcquireNWith] with a 10-minute
+	// internal timeout. Returns [ErrNExceedsCap] if n exceeds the
+	// capacity (which would deadlock), or [ErrInvalidN] if n < 1.
 	AcquireN(n int) error
 
-	// AcquireNWith acquires n slots, blocking until all are claimed or the
-	// context is cancelled. If the context fires after some but not all
-	// slots have been acquired, the partially acquired slots are released
-	// automatically. Returns [ErrAcquireCancelled] on context cancellation,
-	// [ErrNExceedsCap] if n exceeds capacity, or [ErrInvalidN] if n < 1.
+	// AcquireNWith acquires n slots atomically, blocking until all n are
+	// claimed or the context is cancelled. No slots are held while
+	// waiting, eliminating partial-acquisition deadlocks and leaks on
+	// cancellation. Returns [ErrAcquireCancelled] on context
+	// cancellation, [ErrNExceedsCap] if n exceeds capacity, or
+	// [ErrInvalidN] if n < 1.
 	AcquireNWith(ctx context.Context, n int) error
 
-	// AcquireNTimeout acquires n slots, blocking until all are claimed or
-	// the given duration elapses. It is a convenience wrapper around
-	// [Semaphore.AcquireNWith] with an internally created timeout context.
-	// Automatic rollback of partial acquisitions applies on timeout.
+	// AcquireNTimeout acquires n slots atomically, blocking until all are
+	// claimed or the given duration elapses. It is a convenience wrapper
+	// around [Semaphore.AcquireNWith] with an internally created timeout
+	// context.
 	AcquireNTimeout(n int, d time.Duration) error
 
 	// TryAcquireN attempts to acquire n slots without blocking. It returns
@@ -293,21 +300,19 @@ type Semaphore interface {
 	// stop signals to ensure no new work is dispatched while waiting.
 	Wait(ctx context.Context) error
 
-	// Drain forcibly removes all held slots from the internal channel.
-	// Goroutines that previously acquired slots will receive
-	// [ErrReleaseExceedsCount] when they subsequently call
-	// [Semaphore.Release]. Use [Semaphore.Wait] to let in-flight work
-	// finish gracefully before calling Drain. The EWMA utilization metric
-	// is reset to zero. Returns [ErrDrain] if the channel could not be
-	// fully emptied.
+	// Drain forcibly clears all held slots and resets the EWMA
+	// utilization metric to zero. Goroutines that previously acquired
+	// slots will receive [ErrReleaseExceedsCount] when they subsequently
+	// call [Semaphore.Release]. Use [Semaphore.Wait] to let in-flight
+	// work finish gracefully before calling Drain. Blocked [Semaphore.Wait]
+	// callers are woken first, followed by queued acquires.
 	Drain() error
 
-	// Reset replaces the internal channel with a fresh one of the same
-	// capacity, discarding all held slots and resetting the EWMA metric
-	// to zero. Like [Semaphore.Drain], goroutines holding slots from
-	// before the reset will receive [ErrReleaseExceedsCount] on their
-	// next [Semaphore.Release] call. All blocked acquires are woken and
-	// will compete for slots on the new channel.
+	// Reset forcibly clears all held slots while preserving capacity and
+	// resetting the EWMA metric to zero. Like [Semaphore.Drain],
+	// goroutines holding slots from before the reset will receive
+	// [ErrReleaseExceedsCount] on their next [Semaphore.Release] call.
+	// Blocked [Semaphore.Wait] callers and queued acquires are woken.
 	Reset() error
 
 	// Len returns the number of slots currently held (acquired but not
@@ -322,17 +327,18 @@ type Semaphore interface {
 	Cap() int
 
 	// Utilization returns the instantaneous utilization as a float64 in
-	// [0.0, 1.0], computed as Len / Cap. Returns 0 if the capacity is
-	// zero. For a temporally smoothed metric, see
+	// [0.0, 1.0], computed as Len / Cap and clamped to 1.0 while
+	// oversubscribed (Len > Cap during a shrink drain). Returns 0 if the
+	// capacity is zero. For a temporally smoothed metric, see
 	// [Semaphore.UtilizationSmoothed].
 	Utilization() float64
 
 	// UtilizationSmoothed returns the exponentially weighted moving
-	// average (EWMA) of utilization as a float64 in [0.0, 1.0]. The
-	// EWMA is updated on every [Semaphore.Release] and
-	// [Semaphore.ReleaseN] call, providing a stable view of usage over
-	// time that is useful for adaptive concurrency control and capacity
-	// planning decisions.
+	// average (EWMA) of utilization as a float64 clamped to [0.0, 1.0].
+	// The EWMA is updated on every [Semaphore.Release],
+	// [Semaphore.ReleaseN], and [Semaphore.SetCap] call, providing a
+	// stable view of usage over time that is useful for adaptive
+	// concurrency control and capacity planning decisions.
 	UtilizationSmoothed() float64
 
 	// IsEmpty reports whether the semaphore has zero slots currently
@@ -340,39 +346,61 @@ type Semaphore interface {
 	// may change immediately after the call returns.
 	IsEmpty() bool
 
-	// IsFull reports whether all slots are currently held (Len == Cap),
-	// meaning any new [Semaphore.Acquire] call would block and any
-	// [Semaphore.TryAcquire] call would return false. This is a
+	// IsFull reports whether occupancy is at or above capacity
+	// (Len >= Cap), meaning any new [Semaphore.Acquire] call would block
+	// and any [Semaphore.TryAcquire] call would return false. This is a
 	// snapshot and may change immediately after the call returns.
 	IsFull() bool
 
 	// SetCap dynamically adjusts the semaphore's capacity to c. Pass -1
 	// to reset to [defaultCap]; any other value less than 1 returns
-	// [ErrInvalidCap]. If the new capacity is greater than or equal to
-	// the current occupancy, all held slots are preserved. If smaller,
-	// existing slots are drained (holders will receive
-	// [ErrReleaseExceedsCount] on their next release). All blocked
-	// acquires are re-evaluated after the resize.
+	// [ErrInvalidCap].
+	//
+	// Shrinking SetCap below current occupancy preserves all held slots
+	// without draining: no new slots are granted until occupancy drops
+	// below the new capacity, and existing holders release normally
+	// without [ErrReleaseExceedsCount]. While oversubscribed (Len > Cap),
+	// [Semaphore.IsFull] reports true and [Semaphore.Utilization] /
+	// [Semaphore.UtilizationSmoothed] remain clamped to [0.0, 1.0].
+	// Expanding capacity dispatches queued acquires in FIFO order.
 	SetCap(c int) error
 }
 
 type (
+	// waiter is a node in the intrusive doubly-linked FIFO waiter queue
+	// guarded by semaphore.mu.
+	waiter struct {
+		n        int
+		ready    chan struct{}
+		granted  bool
+		grantGen uint64
+		prev     *waiter
+		next     *waiter
+	}
+
 	// semaphore is the concrete, unexported implementation of the
-	// [Semaphore] interface. It uses a channel as the slot pool, a
-	// mutex/cond pair for blocking coordination, and atomic values for
-	// lock-free reads of the channel pointer and EWMA metric.
+	// [Semaphore] interface. It tracks occupancy and capacity with
+	// mutex-guarded integer counters mirrored to atomics for lock-free
+	// introspection, and coordinates blocking acquires via an intrusive
+	// FIFO waiter queue without spawning helper goroutines.
 	//
 	// Fields:
-	//   - mu:       guards all mutable state and is the cond's locker.
-	//   - cond:     broadcast-only condition variable; signalled on every
-	//               Release, ReleaseN, SetCap, Drain, and Reset so that
-	//               blocked acquires and Wait calls can re-evaluate.
-	//   - ch:       atomic pointer to the slot channel, enabling lock-free
-	//               reads from Len, Cap, Utilization, IsEmpty, and IsFull.
-	//               Swapped atomically by SetCap and Reset under mu.
+	//   - mu:       guards held, cap, gen, head, tail, and emptyCh.
+	//   - held:     number of slots currently held (may exceed cap while
+	//               draining down after a SetCap shrink).
+	//   - cap:      current target capacity (>= 1).
+	//   - gen:      generation counter incremented by Drain/Reset so a
+	//               racing cancellation after grant cannot subtract from
+	//               post-drain occupancy.
+	//   - head:     oldest queued waiter in the FIFO waiter list.
+	//   - tail:     newest queued waiter in the FIFO waiter list.
+	//   - emptyCh:  lazily allocated broadcast channel closed and nilled
+	//               whenever held reaches zero to wake Wait callers.
+	//   - heldAtom: lock-free atomic mirror of held for Len/IsEmpty/IsFull/Utilization.
+	//   - capAtom:  lock-free atomic mirror of cap for Cap/IsFull/Utilization.
 	//   - ewma:     stores the smoothed utilization as a uint64-encoded
 	//               float64 (via [math.Float64bits] / [math.Float64frombits]).
-	//               Updated on every Release and ReleaseN; read lock-free
+	//               Updated on Release, ReleaseN, and SetCap; read lock-free
 	//               by [Semaphore.UtilizationSmoothed].
 	//   - observer: optional [Observer] receiving lifecycle callbacks.
 	//               Nil when created via [New] or [Must]; set by
@@ -380,8 +408,14 @@ type (
 	//               but incurs no overhead when nil.
 	semaphore struct {
 		mu       sync.Mutex
-		cond     *sync.Cond
-		ch       atomic.Pointer[chan struct{}]
+		held     int
+		cap      int
+		gen      uint64
+		head     *waiter
+		tail     *waiter
+		emptyCh  chan struct{}
+		heldAtom atomic.Int64
+		capAtom  atomic.Int64
 		ewma     atomic.Uint64
 		observer Observer
 	}

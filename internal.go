@@ -6,7 +6,3 @@ func validateN(n int) error {
 	}
 	return nil
 }
-
-func newChannel(c int) chan struct{} {
-	return make(chan struct{}, c)
-}

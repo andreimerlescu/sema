@@ -57,6 +57,7 @@ jobs:
           - FuzzUtilization
           - FuzzConcurrentAcquireRelease
           - FuzzConcurrentMixedOps
+          - FuzzConcurrentSetCapShrink
       fail-fast: false
 
     steps:

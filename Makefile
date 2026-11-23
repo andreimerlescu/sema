@@ -21,7 +21,8 @@ FUZZ_TARGETS := FuzzNew \
                 FuzzTryAcquireN \
                 FuzzUtilization \
                 FuzzConcurrentAcquireRelease \
-                FuzzConcurrentMixedOps
+                FuzzConcurrentMixedOps \
+                FuzzConcurrentSetCapShrink
 
 .PHONY: test test-all test-unit test-bench test-fuzz
 
